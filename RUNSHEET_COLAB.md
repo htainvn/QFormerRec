@@ -287,6 +287,8 @@ Asserts (fatal) the split ordering, that `his` is positives-only, per-row causal
 ties allowed, and that index 0 is leading-padding only. Then it prints the **provenance of
 the `k_hist` items actually used** — the check that the per-row path took effect at all:
 
+Measured, ML-1M:
+
 ```
 k_hist split    train   valid    test  unk_item        filled
     10 test      9.3%   14.2%   76.5%    0.83%    9.37/10
@@ -294,9 +296,28 @@ k_hist split    train   valid    test  unk_item        filled
     50 test     22.1%   19.8%   58.2%    0.80%   34.64/50
 ```
 
-**If ML-1M test comes back mostly `train`, the change did not take effect.** Expected
-roughly 9 % train / 14 % valid / 77 % test at `k_hist=10`; Amazon-Book should be near
-70 / 16 / 14. The integration test asserts this independently.
+Measured, Amazon-Book (727 463 train rows; 49 s, 1.9 GB peak RSS):
+
+```
+k_hist split    train   valid    test  unk_item        filled
+    10 test     70.1%   16.3%   13.6%   10.00%    8.90/10
+    10 valid    86.5%   13.5%    0.0%    3.99%    8.97/10
+    50 test     88.2%    7.0%    4.9%    4.13%   26.48/50
+```
+
+**If ML-1M test comes back mostly `train`, the change did not take effect.** The
+integration test asserts this independently.
+
+Two things the Amazon run prints that are expected, not faults:
+
+* `[note] 100 (user, item) pairs appear with BOTH labels` — the released Amazon data has
+  100 duplicate pairs with conflicting labels. The check therefore asks whether a pair has
+  *a* positive occurrence rather than trusting the first label seen; 18 089 750 / 18 089 750
+  history entries pass. (ML-1M has no such pairs.)
+* the unk-item rate is **10 %** on Amazon test at `k_hist=10` (vs 0.8 % on ML-1M) — that is
+  the 90 % train-coverage figure, and it is exactly what `unk_item` + `SLOT_HIST_UNK` exist
+  to absorb. It falls to 4 % at `k_hist=50`, because reaching further back lands in
+  train-era items.
 
 ## 5. The four stages
 
@@ -313,11 +334,73 @@ First point the configs at your Vicuna weights:
 !sed -i 's#/content/vicuna-7b-v0#/content/drive/MyDrive/vicuna-7b-v0#' train_configs/*.yaml
 ```
 
-> **Vicuna version.** CoLLM's published numbers are on **Vicuna-7B v0**. Use a v0 copy if
-> you have one. v1.1/v1.5 will shift absolute numbers, so if you switch you must re-run
-> the CoLLM-MF and TALLRec baselines yourself — the table in the spec would no longer
-> apply. You can also skip this stage entirely by dropping in CoLLM's published stage-1
-> checkpoint (linked from their README) as `ckpt_lora`.
+### 5.0 Getting Vicuna-7B v0 — read this before `sed`-ing a path
+
+`OSError: Incorrect path_or_model_id: '/content/drive/MyDrive/vicuna-7b-v0'` just means the
+placeholder path in the configs does not exist yet. There is no one-line download, because
+**`lmsys/vicuna-7b-v0` does not exist as merged weights** — checked against the Hub. Only
+the *delta* is published, and it cannot be loaded directly.
+
+Three options, in decreasing fidelity to CoLLM's published table:
+
+**(a) Apply the official delta — matches the paper.** ~27 GB of downloads and a merge step.
+Do it on local disk, not Drive.
+
+```python
+!pip -q install "git+https://github.com/lm-sys/FastChat.git@v0.1.10"
+!huggingface-cli download huggyllama/llama-7b        --local-dir /content/llama-7b
+!huggingface-cli download lmsys/vicuna-7b-delta-v0   --local-dir /content/vicuna-7b-delta-v0
+!python -m fastchat.model.apply_delta \
+    --base /content/llama-7b \
+    --delta /content/vicuna-7b-delta-v0 \
+    --target /content/vicuna-7b-v0
+```
+
+`huggyllama/llama-7b` is the usual ungated LLaMA-1 mirror (Meta does not redistribute the
+originals; this is why the delta exists at all). FastChat is pinned to `v0.1.10` because
+that is the release whose `apply_delta` matches v0 — CoLLM's `PrepareVicuna.md` says the
+same. Note this pin will pull an old `transformers`, so **do the merge in a separate
+runtime, or re-run §1.2 afterwards** to restore `transformers==4.36.2`.
+
+**(b) A community merged-v0 mirror — fastest way to unblock.** Several exist, e.g.
+`ZzZZCHS/vicuna-7b-v0` (13.5 GB, a genuine `LlamaForCausalLM` config). Provenance is
+unverified — it is someone's re-upload of the merged result — so if the numbers matter,
+prefer (a).
+
+```python
+!huggingface-cli download ZzZZCHS/vicuna-7b-v0 --local-dir /content/vicuna-7b-v0
+```
+
+**(c) A newer Vicuna — cleanest licensing, but changes the baseline.** `lmsys/vicuna-7b-v1.5`
+(Llama-2 based) and `lmsys/vicuna-7b-v1.3` are published as full merged weights, no delta
+step:
+
+```python
+!huggingface-cli download lmsys/vicuna-7b-v1.5 --local-dir /content/vicuna-7b-v1.5
+```
+
+If you go this way you **must re-run the CoLLM-MF and TALLRec baselines yourself** — the
+reference table in §6.2 is v0-only, and comparing your v1.5 numbers against their v0 numbers
+would not be a valid comparison. Say which Vicuna you used in the writeup either way.
+
+Then point the configs at whatever you produced:
+
+```python
+VICUNA = "/content/vicuna-7b-v0"        # or /content/vicuna-7b-v1.5
+!sed -i "s#/content/vicuna-7b-v0#$VICUNA#" train_configs/*.yaml
+!ls $VICUNA && grep -h llama_model train_configs/stage2_qformer_ml1m.yaml
+```
+
+Practical notes:
+
+* **Do not load the weights from Drive.** A Drive-mounted 13.5 GB load is minutes of FUSE
+  overhead every session; download to `/content` (fast local disk) and re-download after a
+  restart, or `cp` from Drive to `/content` first.
+* v0 configs carry `bos_token_id: 0, eos_token_id: 1, vocab_size: 32001`, which differs from
+  v1.5's `1 / 2 / 32000`. That is the known MiniGPT-4-era v0 quirk and is harmless here —
+  the code reads special-token ids from the *tokenizer*, not the config, so the `<unk>`
+  soft-token splicing is unaffected. If the ids ever did collide, the splicing assert in
+  §8 fires loudly rather than corrupting the prompt silently.
 
 ```python
 !sed -i 's#batch_size_train: 32#batch_size_train: 16#' train_configs/stage1_lora_ml1m.yaml  # 40GB A100
