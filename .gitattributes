@@ -1,0 +1,5 @@
+# keep notebook diffs reviewable
+*.ipynb text
+*.py text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf

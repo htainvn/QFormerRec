@@ -28,6 +28,13 @@ COLLM_ROOT = os.environ.get("COLLM_ROOT", os.path.join(HERE, "..", "CoLLM"))
 sys.path.insert(0, os.path.abspath(COLLM_ROOT))
 sys.path.insert(0, HERE)
 
+# must run BEFORE minigpt4 is imported: it stubs `decord`, which CoLLM imports at
+# package level but which has no wheel for Python >= 3.11
+from qformerrec.compat import check_environment, install_import_shims  # noqa: E402
+
+install_import_shims()
+check_environment()
+
 import minigpt4.tasks as tasks  # noqa: E402
 from minigpt4.common.config import Config  # noqa: E402
 from minigpt4.common.dist_utils import get_rank, init_distributed_mode  # noqa: E402

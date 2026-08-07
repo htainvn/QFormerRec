@@ -37,40 +37,110 @@ import torch; print(torch.__version__, torch.cuda.get_device_name(0),
 
 ## 1. Environment
 
-The version pins matter. Two of them are load-bearing:
+Colab's runtime is **Python 3.12**. CoLLM's own `requirements.txt` is from the 3.9/3.10
+era and **cannot be installed there** — do not use it:
 
-* `transformers==4.28.0` — CoLLM vendors its own `modeling_llama.py` against this API.
-* `peft==0.4.0` — CoLLM imports `prepare_model_for_int8_training`, which was renamed in
-  peft ≥ 0.10, and later peft versions also change the LoRA state-dict key layout.
+* `transformers==4.28.0` requires `tokenizers<0.14`, and tokenizers has **no cp312 wheel
+  below 0.14**. pip falls back to building it from Rust source and dies with
+  `Failed building wheel for tokenizers`.
+* `scikit-learn==1.2.2` has no cp312 wheel either — it compiles from source (slow, and
+  unnecessary).
+* `decord` has no wheel for Python ≥ 3.11 at all (last release 0.6.0, 2021).
 
-`scikit-learn` is pinned for a subtler reason: see §5.3.
+So the pins here have both a lower and an upper bound, and each bound has a reason:
+
+| Package | Pin | Lower bound because | Upper bound because |
+|---|---|---|---|
+| `transformers` | **4.36.2** | < 4.34 needs `tokenizers<0.14` → no cp312 wheel | CoLLM vendors its own `modeling_llama.py` against the 4.x `PreTrainedModel` / `transformers.utils` API; 5.x reworks both |
+| `peft` | **0.9.0** | — | 0.10.0 removed `prepare_model_for_int8_training`, which CoLLM imports **by name** |
+| `scikit-learn` | *unpinned* | — | — (see §5.3: the NaN-UAUC problem is fixed in code, not by a pin) |
+| `decord` | **not installed** | — | stubbed by `qformerrec/compat.py`; CoLLM only imports it for video datasets |
+
+### 1.1 Mount Drive and clone both repos
 
 ```python
 from google.colab import drive; drive.mount('/content/drive')
 
-!pip -q install "transformers==4.28.0" "peft==0.4.0" "omegaconf==2.3.0" \
-    "webdataset==0.2.48" "timm==0.6.13" "scikit-learn==1.2.2" \
-    sentencepiece decord iopath opencv-python-headless
-# torch / torchvision / pandas / numpy: keep Colab's preinstalled versions.
-# If numpy 2.x causes import errors in this stack: !pip -q install "numpy<2"
-```
-
-```python
 %cd /content
-!git clone https://github.com/zyang1580/CoLLM.git          # or copy your own checkout
-# put the QFormerRec package next to it
-!cp -r /content/drive/MyDrive/QFormerRec /content/QFormerRec
+!git clone -q https://github.com/zyang1580/CoLLM.git         # the baseline
+!git clone -q https://github.com/htainvn/QFormerRec.git      # this work
 
 import os
-os.environ["COLLM_ROOT"] = "/content/CoLLM"                # read by train_qformer.py
+os.environ["COLLM_ROOT"] = "/content/CoLLM"                  # read by train_qformer.py
 %cd /content/QFormerRec
 !mkdir -p /content/data /content/ckpt /content/logs
+!git log --oneline -1                                        # record the commit you ran
 ```
 
 `QFormerRec` is a **standalone overlay package**: it imports `minigpt4.*` from
 `COLLM_ROOT` and registers its own model / task / runner / builders on import. **No file
-in the CoLLM tree is modified**, so the baseline stays reproducible from the same
-checkout.
+in the CoLLM tree is modified**, so the baseline stays reproducible from the same checkout.
+The package itself needs no install — `train_qformer.py` puts both trees on `sys.path`.
+
+Pin a revision when you want a run reproducible later:
+
+```python
+# !cd /content/QFormerRec && git checkout -q <sha>
+```
+
+Iterating on the code? **Pull, do not re-clone** — a re-clone wipes the config edits you
+make in §6/§7:
+
+```python
+%cd /content/QFormerRec
+!git pull -q && git log --oneline -1
+```
+
+**If the repo is private**, the anonymous HTTPS clone fails with a 404 (Colab has no SSH
+key, so the `git@github.com:` remote you push with will not work there either). Use a
+fine-grained PAT with read access and keep it out of the saved notebook:
+
+```python
+from getpass import getpass
+tok = getpass("GitHub token: ")
+!git clone -q https://{tok}@github.com/htainvn/QFormerRec.git
+del tok
+```
+
+The Drive mount is only for the Vicuna weights (§6) and for keeping logs and checkpoints
+across session restarts (§7) — the code comes from git.
+
+### 1.2 Install the pinned stack
+
+```python
+!pip -q install "transformers==4.36.2" "peft==0.9.0" \
+    omegaconf webdataset timm iopath sentencepiece opencv-python-headless \
+    scikit-learn pandas scipy
+# torch / torchvision / numpy: keep Colab's preinstalled versions.
+# Do NOT install decord, and do NOT pin scikit-learn or numpy.
+```
+
+Or equivalently `!pip -q install -r requirements.txt`, which carries the same pins and the
+reasoning as comments.
+
+Two things to expect, both harmless:
+
+1. **Dependency-conflict warnings** naming `gradio` and the preinstalled `transformers`
+   5.x / `huggingface_hub` 1.x. Colab ships transformers 5.x; pinning 4.36.2 downgrades
+   `huggingface_hub` below 1.0, which the preinstalled gradio dislikes. Nothing here uses
+   gradio.
+2. Colab pre-imports some of these packages, so **restart the runtime after installing**
+   (`Runtime → Restart session`), then resume from §1.3. Without a restart you can end up
+   running against the *old* transformers still in memory.
+
+### 1.3 Verify the environment before going further
+
+```python
+%cd /content/QFormerRec
+!python -c "from qformerrec.compat import check_environment as c; import sys; sys.exit(1 if c() else 0)" \
+    && echo "environment OK"
+```
+
+`check_environment()` also runs automatically at the top of every entry point and prints a
+`[compat]` line. It names the two failure modes above explicitly — a `peft` without
+`prepare_model_for_int8_training`, and a `transformers` whose `utils` no longer exports the
+docstring decorators CoLLM's vendored LLaMA imports — rather than letting them surface as
+confusing ImportErrors deep inside CoLLM.
 
 ---
 
@@ -315,10 +385,13 @@ around `roc_auc_score`. scikit-learn ≥ ~1.3 *returns `nan`* for single-class i
 of raising, so those users are no longer skipped and the mean comes out `NaN`. On the
 released ML-1M valid split that is **44 of 283 evaluable users** — i.e. UAUC, the metric
 this project is selected and reported on, silently becomes NaN, checkpoint selection never
-fires, and every reported UAUC is garbage. Two independent defences are in place: the pin
-`scikit-learn==1.2.2` in §1, and `uauc_score()` in the task, which filters those users
-explicitly and is numerically identical to `uAUC_me` under sklearn ≤ 1.2. The eval log
-also reports `uauc_users_scored` / `uauc_users_skipped` so you can see it happening.
+fires, and every reported UAUC is garbage. The fix is in code, not in a pin: `qformerrec/metrics.py::uauc_score()` filters those
+users explicitly and is numerically identical to `uAUC_me` under sklearn ≤ 1.2 (verified —
+both stacks return UAUC 0.487485 on the same inputs). That is why `scikit-learn` is
+unpinned here even though CoLLM pins 1.2.2, which has no cp312 wheel. The eval log reports
+`uauc_users_scored` / `uauc_users_skipped` so you can see the filtering happen, and
+`scripts/pretrain_mf.py` uses the same function so the stage-0 gate cannot silently NaN
+either.
 
 ### 5.4 Stage 3 — joint tuning with LoRA at lr/10
 
@@ -469,6 +542,11 @@ run:
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `Failed building wheel for tokenizers` | `transformers==4.28.0` wants `tokenizers<0.14`, which has no cp312 wheel | use the §1 pins (`transformers==4.36.2`); do **not** use CoLLM's `requirements.txt` |
+| `ModuleNotFoundError: No module named 'decord'` | no decord wheel for Python ≥3.11 | do not install it; entry points call `install_import_shims()` — if you wrote your own script, call it before importing `minigpt4` |
+| `ImportError: cannot import name 'prepare_model_for_int8_training'` | peft ≥ 0.10 | `pip install peft==0.9.0` |
+| scikit-learn compiles from source for minutes | the `==1.2.2` pin | drop the pin; UAUC no longer depends on sklearn's version |
+| changes to installed versions seem ignored | Colab pre-imported the old ones | `Runtime → Restart session`, then re-run from the `%cd` cell |
 | `valid_uauc: NaN` | sklearn ≥1.3 vs `uAUC_me` | pin `scikit-learn==1.2.2` (§5.3); already handled by `uauc_score` |
 | metrics ≈ TALLRec, soft tokens ignored | norm mismatch | check `pref_token_norm` vs `llm_emb_norm` in the diag block |
 | all `L` tokens identical | `λ_div` too low, or `type_bias` not learning | check `token_cosine_offdiag`; raise `lambda_div` to 0.3 |
@@ -489,7 +567,8 @@ run:
 
 ## 9. Self-checks before burning GPU hours
 
-Both run on CPU in a couple of minutes and need no Vicuna weights.
+All three run on CPU in a couple of minutes and need no Vicuna weights. Both test scripts
+begin by printing and validating the environment, so they double as the §1 verification.
 
 ```python
 !python scripts/check_pit_history.py --data_dir /content/data/ml-1m/ --k_hist 10 20 50
@@ -562,6 +641,7 @@ Judgment calls worth knowing about before you read the results.
 | new files under `minigpt4/` | standalone `qformerrec/` overlay package | zero edits to the CoLLM tree, so the baseline stays reproducible and the diff is reviewable |
 | prompt ~55–70 tokens | 86.5 with CoLLM's wording; 60.5 with the terse prompt (both ship) | see §6.4 |
 | `T` new files incl. `samplers.py` under `minigpt4/datasets` | `qformerrec/datasets/samplers.py` | same reason as above |
+| CoLLM's `requirements.txt` (transformers 4.28 / peft 0.4 / sklearn 1.2.2, Python 3.9-era) | transformers 4.36.2 / peft 0.9.0, sklearn+numpy unpinned, decord stubbed | that stack cannot be installed on Colab's Python 3.12 at all (§1). Verified: all 75 smoke + 106 integration checks pass on transformers 4.36.2, peft 0.9.0, tokenizers 0.15.2, sklearn 1.9, numpy 2.4, torch 2.13 |
 | — | added: gradient clipping (1.0), per-group `lr_scale` scheduler, UAUC-safe metric, warm/cold split fix, per-step `empty_cache` made optional | CoLLM's loop has no clipping, its schedulers overwrite per-group lrs, its UAUC NaNs on modern sklearn, and its ML-1M warm/cold split does not run at all |
 
 Also worth stating in the paper: Amazon-Book genres are KMeans pseudo-genres, not real

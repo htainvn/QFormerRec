@@ -25,9 +25,21 @@ import torch.nn as nn
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 
-sys.path.insert(0, os.environ.get("COLLM_ROOT", "."))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
+sys.path.insert(0, os.path.abspath(os.environ.get("COLLM_ROOT",
+                                                  os.path.join(HERE, "..", "..", "CoLLM"))))
+
+from qformerrec.compat import install_import_shims  # noqa: E402
+
+install_import_shims()
+
+# UAUC from qformerrec.metrics, not CoLLM's uAUC_me: the latter returns NaN on
+# scikit-learn >= ~1.3 (see qformerrec/metrics.py), and this is the gate you
+# compare against CoLLM's published MF row -- a NaN here would be silent.
 from minigpt4.models.rec_base_models import MatrixFactorization  # noqa: E402
-from minigpt4.tasks.rec_base_task import uAUC_me  # noqa: E402
+
+from qformerrec.metrics import uauc_score  # noqa: E402
 
 
 def main():
@@ -83,7 +95,7 @@ def main():
             pre.extend(s.detach().cpu().numpy())
             lab.extend(batch[:, -1].cpu().numpy())
         auc = roc_auc_score(lab, pre)
-        uauc, _, _ = uAUC_me(np.array(usr), np.array(pre), np.array(lab))
+        uauc, _ = uauc_score(usr, pre, lab)
         return auc, uauc
 
     best_auc, best, bad = -1.0, None, 0

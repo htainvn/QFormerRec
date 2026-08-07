@@ -1,5 +1,7 @@
 # CoLLM-QFormer (`QFormerRec`)
 
+<https://github.com/htainvn/QFormerRec>
+
 A candidate-aware **Q-Former CIE** for [CoLLM](https://github.com/zyang1580/CoLLM). It
 replaces CoLLM's CIE module (MF embedding → single MLP → one soft token per user/item)
 with a Q-Former that reads a per-user **collaborative memory bank** and emits `L`
@@ -67,7 +69,9 @@ qformerrec/
   models/minigpt4rec_qformer.py    MiniGPT4RecQFormer(MiniGPT4Rec_v2), splicing, forward, diagnostics
   datasets/rec_datasets_qformer.py dataset + builders (fixes the ML-1M warm/cold split)
   datasets/samplers.py             UserGroupedBatchSampler (L_rank needs same-user pairs)
-  tasks/rec_qformer_task.py        eval + UAUC-safe metric + grad clipping + timing
+  metrics.py                       UAUC that does not depend on the sklearn version
+  compat.py                        import shims + environment check for modern Python
+  tasks/rec_qformer_task.py        eval + grad clipping + timing
   runners/runner_qformer.py        per-group lr_scale, grouped sampler wiring, diagnostics
 scripts/
   pretrain_mf.py                   stage 0 (parameterised port of CoLLM's MF baseline)
@@ -86,8 +90,16 @@ modified**, so the baseline remains reproducible from the same tree.
 
 ## Quick start
 
+Clone both repos side by side; nothing needs installing, `train_qformer.py` puts both
+trees on `sys.path`.
+
 ```bash
-export COLLM_ROOT=/path/to/CoLLM
+git clone https://github.com/zyang1580/CoLLM.git        # the baseline
+git clone https://github.com/htainvn/QFormerRec.git     # this work
+cd QFormerRec
+pip install -r requirements.txt   # transformers 4.36.2 + peft 0.9.0; see the file's comments
+
+export COLLM_ROOT=../CoLLM
 python scripts/pretrain_mf.py   --data_dir data/ml-1m/ --out ckpt/mf_ml1m_d256.pth
 python scripts/build_memory.py  --data_dir data/ml-1m/ --mf_ckpt ckpt/mf_ml1m_d256.pth \
                                 --out ckpt/memory_index_ml1m.pkl --dataset ml1m \
@@ -122,6 +134,15 @@ Found while building this; all are load-bearing.
    first so it is correct under fp16 AMP.
 6. `RunnerBase.model` returns `None` when the model already sits on the target device, and
    `PrefetchLoader` hard-requires CUDA — both blocked CPU debugging.
+7. **CoLLM's `requirements.txt` cannot be installed on a current Python.** Colab is on
+   3.12; `transformers==4.28.0` requires `tokenizers<0.14`, which has no cp312 wheel, so
+   pip attempts a Rust source build and fails. `scikit-learn==1.2.2` compiles from source,
+   and `decord` has no wheel for ≥3.11 at all. This project pins `transformers==4.36.2` +
+   `peft==0.9.0` (the widest window where CoLLM's vendored LLaMA and
+   `prepare_model_for_int8_training` both still work), leaves scikit-learn/numpy unpinned,
+   and stubs `decord` in [`qformerrec/compat.py`](qformerrec/compat.py).
+   `check_environment()` names each of these failure modes instead of letting them surface
+   as ImportErrors inside CoLLM.
 
 And one bug of our own worth recording: `L_attn`'s Bhattacharyya coefficient needs an
 `eps` inside the `sqrt`. Masked memory slots get exactly zero attention and

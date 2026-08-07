@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+.venv/
+venv/
+
+# run outputs and large artifacts -- never commit these
+logs/
+output/
+*.pth
+*.pkl
+*.log
+data/
+ckpt/

@@ -1,18 +1,36 @@
-# Verified combination for CoLLM-QFormer. The first three pins are load-bearing:
-#  transformers 4.28 -- CoLLM vendors modeling_llama.py against this API
-#  peft 0.4.0        -- CoLLM imports prepare_model_for_int8_training (gone in peft>=0.10)
-#  scikit-learn 1.2.2-- newer sklearn makes CoLLM's uAUC_me return NaN (see README)
-transformers==4.28.0
-peft==0.4.0
-scikit-learn==1.2.2
-omegaconf==2.3.0
-webdataset==0.2.48
-timm==0.6.13
-sentencepiece
-decord
+# Verified on Python 3.11/3.12 (Colab's current runtime is 3.12).
+#
+# Two pins are load-bearing, and both have an *upper* and a *lower* bound:
+#
+#   transformers==4.36.2
+#     lower: CoLLM's original pin (4.28.0) requires tokenizers<0.14, and tokenizers
+#            has no cp312 wheel below 0.14 -- pip falls back to a Rust source build
+#            and fails on Colab. The oldest workable transformers is ~4.34.
+#     upper: CoLLM vendors its own minigpt4/models/modeling_llama.py, which imports
+#            add_start_docstrings / replace_return_docstrings from transformers.utils
+#            and subclasses PreTrainedModel directly. transformers 5.x reworks both.
+#
+#   peft==0.9.0
+#     CoLLM's minigpt4rec_v2 imports `prepare_model_for_int8_training` by name.
+#     peft removed it in 0.10.0, so anything >=0.10 fails at import.
+#
+# scikit-learn and numpy are deliberately UNPINNED: qformerrec/metrics.py computes
+# UAUC in a way that does not depend on roc_auc_score's single-class behaviour, so
+# CoLLM's old scikit-learn==1.2.2 pin (which has no cp312 wheel and builds from
+# source) is no longer needed. Verified with scikit-learn 1.9 / numpy 2.4.
+#
+# `decord` is intentionally absent: it has no wheel for Python >= 3.11 (last release
+# 0.6.0, 2021) and CoLLM only imports it for video datasets. qformerrec/compat.py
+# stubs it before minigpt4 is imported.
+transformers==4.36.2
+peft==0.9.0
+omegaconf
+webdataset
+timm
 iopath
+sentencepiece
 opencv-python-headless
-numpy<2
+scikit-learn
 pandas
 scipy
-# torch / torchvision: use the build that matches your CUDA (Colab's preinstalled is fine)
+# torch / torchvision: use the build matching your CUDA (Colab's preinstalled is fine)

@@ -16,7 +16,6 @@ checkpoint, and a CoLLM-format data dir. The tiny LLaMA is created on the fly.
 import argparse
 import os
 import sys
-import types
 
 import numpy as np
 import torch
@@ -25,21 +24,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, ROOT)
 
-# `minigpt4.datasets.data_utils` imports decord purely for video datasets we
-# never touch; stub it so the test does not need the wheel.
-if "decord" not in sys.modules:
-    try:
-        import decord  # noqa: F401
-    except ImportError:
-        import importlib.machinery
+from qformerrec.compat import check_environment, install_import_shims  # noqa: E402
 
-        stub = types.ModuleType("decord")
-        # transformers' import_utils calls find_spec("decord"), which raises if
-        # __spec__ is None
-        stub.__spec__ = importlib.machinery.ModuleSpec("decord", None)
-        stub.bridge = types.SimpleNamespace(set_bridge=lambda *a, **k: None)
-        stub.VideoReader = object
-        sys.modules["decord"] = stub
+install_import_shims()
 
 _failures = []
 
@@ -137,6 +124,10 @@ def main():
     import qformerrec.models.minigpt4rec_qformer as mmod  # noqa: F401
     import qformerrec.runners.runner_qformer as rmod  # noqa: F401
     import qformerrec.tasks.rec_qformer_task as tmod  # noqa: F401
+
+    print("\n=== environment ===")
+    check_environment()
+    check("environment has no known-bad version combination", not check_environment())
 
     print("\n=== registry ===")
     for kind, name in [("model", "mini_gpt4rec_qformer"), ("task", "rec_qformer"),
