@@ -347,9 +347,12 @@ Three options, in decreasing fidelity to CoLLM's published table:
 Do it on local disk, not Drive.
 
 ```python
+from huggingface_hub import snapshot_download
+snapshot_download("huggyllama/llama-7b",      local_dir="/content/llama-7b")
+snapshot_download("lmsys/vicuna-7b-delta-v0", local_dir="/content/vicuna-7b-delta-v0")
+```
+```python
 !pip -q install "git+https://github.com/lm-sys/FastChat.git@v0.1.10"
-!huggingface-cli download huggyllama/llama-7b        --local-dir /content/llama-7b
-!huggingface-cli download lmsys/vicuna-7b-delta-v0   --local-dir /content/vicuna-7b-delta-v0
 !python -m fastchat.model.apply_delta \
     --base /content/llama-7b \
     --delta /content/vicuna-7b-delta-v0 \
@@ -368,7 +371,8 @@ unverified — it is someone's re-upload of the merged result — so if the numb
 prefer (a).
 
 ```python
-!huggingface-cli download ZzZZCHS/vicuna-7b-v0 --local-dir /content/vicuna-7b-v0
+from huggingface_hub import snapshot_download
+snapshot_download("ZzZZCHS/vicuna-7b-v0", local_dir="/content/vicuna-7b-v0")
 ```
 
 **(c) A newer Vicuna — cleanest licensing, but changes the baseline.** `lmsys/vicuna-7b-v1.5`
@@ -376,7 +380,8 @@ prefer (a).
 step:
 
 ```python
-!huggingface-cli download lmsys/vicuna-7b-v1.5 --local-dir /content/vicuna-7b-v1.5
+from huggingface_hub import snapshot_download
+snapshot_download("lmsys/vicuna-7b-v1.5", local_dir="/content/vicuna-7b-v1.5")
 ```
 
 If you go this way you **must re-run the CoLLM-MF and TALLRec baselines yourself** — the
@@ -390,6 +395,15 @@ VICUNA = "/content/vicuna-7b-v0"        # or /content/vicuna-7b-v1.5
 !sed -i "s#/content/vicuna-7b-v0#$VICUNA#" train_configs/*.yaml
 !ls $VICUNA && grep -h llama_model train_configs/stage2_qformer_ml1m.yaml
 ```
+
+> **Why the Python API and not `huggingface-cli`?** That command was renamed to `hf` in
+> `huggingface_hub` 0.34.0 and **removed outright in 1.0.0** (later 1.x re-added it as a
+> deprecation shim). Which one you get depends on *when* you run the cell: the §1.2 pins put
+> you on hub 0.36.2 (both `hf` and `huggingface-cli` work, the latter with a warning), while
+> Colab preinstalls 1.23.0 (`huggingface-cli` is a shim). `snapshot_download` has the same
+> `(repo_id, local_dir=...)` signature on both, so it works either way. If you want a shell
+> command, `!hf download <repo> --local-dir <dir>` is the current spelling. Do not pass
+> `local_dir_use_symlinks` — removed in hub 1.0.
 
 Practical notes:
 
@@ -625,6 +639,8 @@ run:
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `huggingface-cli: command not found`, or a deprecation warning | renamed to `hf` in hub 0.34, removed in hub 1.0 | use `snapshot_download(repo_id, local_dir=...)` — stable across 0.x and 1.x — or `hf download` |
+| `OSError: Incorrect path_or_model_id: '.../vicuna-7b-v0'` | the config's Vicuna path is a placeholder, and no merged `vicuna-7b-v0` exists on the Hub | see §5.0: apply the delta, use a merged mirror, or switch to v1.5 and re-run the baselines |
 | `Failed building wheel for tokenizers` | `transformers==4.28.0` wants `tokenizers<0.14`, which has no cp312 wheel | use the §1 pins (`transformers==4.36.2`); do **not** use CoLLM's `requirements.txt` |
 | `ModuleNotFoundError: No module named 'decord'` | no decord wheel for Python ≥3.11 | do not install it; entry points call `install_import_shims()` — if you wrote your own script, call it before importing `minigpt4` |
 | `ImportError: cannot import name 'prepare_model_for_int8_training'` | peft ≥ 0.10 | `pip install peft==0.9.0` |
