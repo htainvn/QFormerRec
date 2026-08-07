@@ -33,7 +33,6 @@ sys.path.insert(0, HERE)
 from qformerrec.compat import check_environment, install_import_shims  # noqa: E402
 
 install_import_shims()
-check_environment()
 
 import minigpt4.tasks as tasks  # noqa: E402
 from minigpt4.common.config import Config  # noqa: E402
@@ -76,6 +75,9 @@ def get_runner_class(cfg):
 
 
 def main():
+    # strict: refuse to start on a known-bad stack rather than train for hours and
+    # report loss=nan (which is exactly what transformers 5.x does here).
+    check_environment(strict=os.environ.get("QFORMERREC_ALLOW_BAD_ENV") != "1")
     job_id = now()
     cfg = Config(parse_args())
     init_distributed_mode(cfg.run_cfg)

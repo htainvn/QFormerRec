@@ -143,6 +143,15 @@ Found while building this; all are load-bearing.
    and stubs `decord` in [`qformerrec/compat.py`](qformerrec/compat.py).
    `check_environment()` names each of these failure modes instead of letting them surface
    as ImportErrors inside CoLLM.
+8. **transformers 5.x silently NaNs CoLLM's vendored LLaMA.** Its loader reports
+   `self_attn.rotary_emb.inv_freq | MISSING` and leaves the vendored
+   `LlamaRotaryEmbedding`'s `cos_cached` / `sin_cached` *buffers* as uninitialised memory;
+   4.x re-runs the module init instead. Every **parameter** stays finite, so the only
+   symptom is `loss=nan` after a full model build. Colab preinstalls 5.13.1, so this is the
+   default outcome if the pins are not applied. `check_vendored_llama()` reproduces it in
+   under a second — via the realistic path (a checkpoint written by *transformers'* class,
+   loaded by the *vendored* one) and by inspecting buffers, since neither a version test nor
+   a parameter scan catches it — and the entry points refuse to start.
 
 And one bug of our own worth recording: `L_attn`'s Bhattacharyya coefficient needs an
 `eps` inside the `sqrt`. Masked memory slots get exactly zero attention and

@@ -91,6 +91,9 @@ def main():
         install_import_shims()
         problems = check_environment()
         print("  ->", "no known problems" if not problems else f"{len(problems)} PROBLEM(S) above")
+        if problems:
+            print("  (this is the check that catches transformers 5.x, which imports and")
+            print("   loads fine and then silently produces NaN)")
     except Exception as e:                                      # noqa: BLE001
         print(f"  cannot import qformerrec.compat: {type(e).__name__}: {e}")
         print("  --> run this from inside the QFormerRec checkout")

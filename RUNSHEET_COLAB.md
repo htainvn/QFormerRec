@@ -51,7 +51,7 @@ So the pins here have both a lower and an upper bound, and each bound has a reas
 
 | Package | Pin | Lower bound because | Upper bound because |
 |---|---|---|---|
-| `transformers` | **4.36.2** | < 4.34 needs `tokenizers<0.14` → no cp312 wheel | CoLLM vendors its own `modeling_llama.py` against the 4.x `PreTrainedModel` / `transformers.utils` API; 5.x reworks both |
+| `transformers` | **4.36.2** | < 4.34 needs `tokenizers<0.14` → no cp312 wheel | **5.x silently produces `loss=nan`** — see below. Verified working on 4.28.0 and 4.49.0 |
 | `peft` | **0.9.0** | — | 0.10.0 removed `prepare_model_for_int8_training`, which CoLLM imports **by name** |
 | `scikit-learn` | *unpinned* | — | — (see §5.3: the NaN-UAUC problem is fixed in code, not by a pin) |
 | `decord` | **not installed** | — | stubbed by `qformerrec/compat.py`; CoLLM only imports it for video datasets |
@@ -127,6 +127,18 @@ Two things to expect, both harmless:
 2. Colab pre-imports some of these packages, so **restart the runtime after installing**
    (`Runtime → Restart session`), then resume from §1.3. Without a restart you can end up
    running against the *old* transformers still in memory.
+
+> **The transformers 5.x trap — the single most expensive way to lose an afternoon.**
+> Colab preinstalls transformers 5.13.1. On 5.x, CoLLM's vendored `modeling_llama.py`
+> imports fine, loads fine, and reports **every parameter finite** — then the forward
+> returns NaN and you get `loss=nan`. The mechanism: 5.x's loader reports
+> `self_attn.rotary_emb.inv_freq | MISSING` and leaves the vendored
+> `LlamaRotaryEmbedding`'s `cos_cached` / `sin_cached` **buffers** as uninitialised memory
+> (values like `1e+24`, `6e-38`). transformers 4.x re-runs the module init and fills them
+> correctly. Because those are *buffers*, not parameters, nothing looks wrong until the loss
+> is NaN. `check_environment()` now reproduces this in under a second and **refuses to
+> start** — if you must override, `QFORMERREC_ALLOW_BAD_ENV=1`, but the run will be
+> garbage.
 
 ### 1.3 Verify the environment before going further
 
@@ -474,6 +486,7 @@ train history item is a train item) and nonzero on valid/test.
 | `rank_pairs_per_batch` | ≫ 0 (≈15 at U=4×m=4; ~72 at U=8×m=6) | the user-grouped sampler is off → `L_rank` has no signal |
 | `hist_slots_filled` | ≫ 0 | 0 → `PitHistItems` is not reaching the model |
 | `hist_unk_rate` | ~1 % (ML-1M), ~10 % (Amazon) | much higher → wrong `item_in_train`, i.e. a stale memory index |
+| `loss_bce` | a real number | `nan` → almost certainly transformers 5.x (§1.2) |
 | `history_source` | `pit` | `train_only` means you are running the ablation by accident |
 | `valid_uauc` in `log.txt` | a real number | **NaN → see below** |
 
@@ -641,6 +654,8 @@ run:
 |---|---|---|
 | `huggingface-cli: command not found`, or a deprecation warning | renamed to `hf` in hub 0.34, removed in hub 1.0 | use `snapshot_download(repo_id, local_dir=...)` — stable across 0.x and 1.x — or `hf download` |
 | `OSError: Incorrect path_or_model_id: '.../vicuna-7b-v0'` | the config's Vicuna path is a placeholder, and no merged `vicuna-7b-v0` exists on the Hub | see §5.0: apply the delta, use a merged mirror, or switch to v1.5 and re-run the baselines |
+| `loss=nan`, all params finite, log mentions `LOAD REPORT` or `v4.50` | transformers 5.x corrupting the vendored LLaMA's rotary buffers | `pip install "transformers==4.36.2" "peft==0.9.0"` **and restart the runtime**. `LOAD REPORT` appears only in 5.x, so it is a reliable tell |
+| `RuntimeError: incompatible environment` at startup | the fail-fast check working as intended | read the `[compat] PROBLEM:` lines directly above it |
 | `Failed building wheel for tokenizers` | `transformers==4.28.0` wants `tokenizers<0.14`, which has no cp312 wheel | use the §1 pins (`transformers==4.36.2`); do **not** use CoLLM's `requirements.txt` |
 | `ModuleNotFoundError: No module named 'decord'` | no decord wheel for Python ≥3.11 | do not install it; entry points call `install_import_shims()` — if you wrote your own script, call it before importing `minigpt4` |
 | `ImportError: cannot import name 'prepare_model_for_int8_training'` | peft ≥ 0.10 | `pip install peft==0.9.0` |

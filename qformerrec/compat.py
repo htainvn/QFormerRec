@@ -71,13 +71,88 @@ def install_import_shims(verbose=True):
     return shimmed
 
 
-def check_environment(strict=False):
+def check_vendored_llama():
+    """Numerically verify CoLLM's vendored LLaMA on the installed transformers.
+
+    This is the check that matters, and neither a version test nor an import test
+    can replace it.
+
+    The concrete failure on transformers 5.x: its loader reports
+    ``self_attn.rotary_emb.inv_freq | MISSING`` and then leaves the vendored
+    ``LlamaRotaryEmbedding``'s ``cos_cached`` / ``sin_cached`` **buffers** as
+    uninitialised memory (values like 1e+24 and 6e-38). transformers 4.x instead
+    re-runs the module init and fills them correctly. Because those are buffers
+    rather than parameters, ``named_parameters()`` reports everything finite and
+    the corruption only surfaces as ``loss=nan`` after a full model build --
+    an expensive and very confusing way to find out.
+
+    Reproducing it needs the *realistic* load: a checkpoint written by
+    **transformers' own** ``LlamaForCausalLM`` (which, like every real Vicuna
+    checkpoint, contains no ``rotary_emb.inv_freq`` key) loaded by the **vendored**
+    class. Saving with the vendored class instead would write ``inv_freq`` into the
+    checkpoint, nothing would be MISSING, and the bug would stay hidden -- as would
+    building straight from a config, since ``__init__`` computes the caches
+    properly. The probe also has to inspect buffers, not just parameters. A
+    2-layer, 32-dim model keeps this well under a second, with no download.
+
+    Returns a problem string, or None if healthy / not checkable here.
+    """
+    try:
+        import tempfile
+
+        import torch
+        import transformers
+        from transformers import LlamaConfig
+        from transformers import LlamaForCausalLM as HFLlamaForCausalLM
+
+        from minigpt4.models.modeling_llama import LlamaForCausalLM
+    except (ImportError, ModuleNotFoundError):
+        return None            # minigpt4 not on sys.path yet -- nothing to check
+    try:
+        cfg = LlamaConfig(vocab_size=64, hidden_size=32, intermediate_size=64,
+                          num_hidden_layers=2, num_attention_heads=4,
+                          max_position_embeddings=64)
+        torch.manual_seed(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            # written by transformers' class == what a real Vicuna dir looks like
+            HFLlamaForCausalLM(cfg).save_pretrained(tmp)
+            m = LlamaForCausalLM.from_pretrained(tmp, torch_dtype=torch.float16)
+            m = m.float().eval()
+
+            bad_buf = [n for n, b in m.named_buffers()
+                       if b.is_floating_point() and not torch.isfinite(b).all()]
+            ids = torch.tensor([[1, 2, 3, 4], [1, 2, 3, 4]])
+            mask = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])   # left padding, as we use
+            with torch.no_grad():
+                out = m(input_ids=ids, attention_mask=mask)
+            ok = torch.isfinite(out.logits).all()
+
+        if bad_buf or not ok:
+            detail = (f"non-finite buffers after from_pretrained: {bad_buf[:4]}"
+                      if bad_buf else "forward produced non-finite logits")
+            return (
+                f"transformers {transformers.__version__} breaks CoLLM's vendored "
+                f"modeling_llama -- {detail}. Every *parameter* is finite, so this "
+                "shows up only as `loss=nan` during training. Fix:\n"
+                '            pip install "transformers==4.36.2" "peft==0.9.0"\n'
+                "        then RESTART the runtime (Colab pre-imports transformers 5.x, "
+                "so without a restart the downgrade has no effect)."
+            )
+    except Exception as e:                                      # noqa: BLE001
+        import transformers
+        return (f"CoLLM's vendored modeling_llama cannot run on transformers "
+                f"{transformers.__version__}: {type(e).__name__}: {e}")
+    return None
+
+
+def check_environment(strict=False, numeric=True):
     """Report the versions that actually matter, and flag known-bad combinations.
 
     Cheap to call and worth calling: the failure modes it catches (a peft without
     ``prepare_model_for_int8_training``, a transformers whose ``utils`` no longer
-    exports the docstring decorators CoLLM's vendored ``modeling_llama`` imports)
-    otherwise surface as confusing ImportErrors deep inside CoLLM.
+    exports the docstring decorators CoLLM's vendored ``modeling_llama`` imports,
+    and a transformers that silently NaNs that model) otherwise surface as
+    confusing ImportErrors or a bare ``loss=nan`` deep inside CoLLM.
     """
     import platform
 
@@ -95,7 +170,26 @@ def check_environment(strict=False):
     notes.append(f"python={py} torch={th} transformers={tf} peft={pf} "
                  f"tokenizers={tk} scikit-learn={sk}")
 
-    # CoLLM's vendored modeling_llama needs these from transformers.utils
+    # transformers 5.x is the one that bites hardest: everything imports, every
+    # weight loads finite, and then the vendored LLaMA's forward returns NaN.
+    if tf:
+        try:
+            major = int(str(tf).split(".")[0])
+        except ValueError:
+            major = None
+        if major is not None and major >= 5:
+            problems.append(
+                f"transformers {tf} is a 5.x release. CoLLM's vendored "
+                "modeling_llama produces NaN hidden states on 5.x -- you will see "
+                "`loss=nan` with all parameters finite. Install transformers<5:\n"
+                '            pip install "transformers==4.36.2" "peft==0.9.0"\n'
+                "        and RESTART the runtime afterwards (Colab pre-imports "
+                "transformers 5.x, so without a restart the downgrade has no effect)."
+            )
+
+    # CoLLM's vendored modeling_llama needs these from transformers.utils.
+    # NOTE: 5.x still exports all three, so this check alone is not sufficient --
+    # that is what check_vendored_llama() is for.
     try:
         from transformers.utils import (  # noqa: F401
             add_start_docstrings,
@@ -117,6 +211,12 @@ def check_environment(strict=False):
             "CoLLM's minigpt4rec_v2 imports by name (removed in peft 0.10.0). "
             "Pin peft<=0.9.0."
         )
+
+    # the decisive test: does the vendored model actually compute finite numbers?
+    if numeric:
+        bad = check_vendored_llama()
+        if bad:
+            problems.append(bad)
 
     for line in notes:
         print(f"[compat] {line}")
