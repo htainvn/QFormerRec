@@ -1,0 +1,130 @@
+# ---------------------------------------------------------------------------
+# Stage 3 -- joint tuning: everything from stage 2 PLUS LoRA at lr/10.
+#
+# Mirrors CoLLM's T1/T2 tuning, which is where its best numbers came from -- do
+# not skip it. Start from the stage-2 best checkpoint (`ckpt`) AND the stage-1
+# LoRA weights (`ckpt_lora`), since the stage-2 checkpoint only stores the
+# parameters that were trainable in stage 2.
+# ---------------------------------------------------------------------------
+model:
+  arch: mini_gpt4rec_qformer
+  model_type: pretrain_vicuna
+  freeze_rec: True            # False for the final runs (T2-style tuning)
+  freeze_proj: False          # the <UserID>/<TargetItemID> mapping trains here
+  freeze_lora: False          # <-- stage 3 unfreezes LoRA
+  max_txt_len: 1024
+  proj_token_num: 1
+  proj_drop: 0
+  proj_mid_times: 10
+  end_sym: "###"
+  prompt_path: "prompts/qformer_amazon.txt"
+  prompt_template: '{}'
+  llama_model: /content/vicuna-7b-v0
+  user_num: -100
+  item_num: -100
+  ans_type: 'v2'
+  rec_model: "MF"
+  n_titles_kept: 0            # set to 3 for the `+titles` fallback/ablation
+  diag_log_freq: 200          # steps between anti-collapse diagnostic dumps
+
+  ckpt_lora: /content/logs/stage1_amazon/checkpoint_best.pth   # cached stage 1
+  ckpt: /content/logs/stage2_amazon/checkpoint_best.pth        # stage-2 best
+
+  lora_config:
+    use_lora: True
+    r: 8
+    alpha: 16
+    target_modules: ["q_proj", "v_proj"]
+    dropout: 0.05
+  rec_config:
+    user_num: -100
+    item_num: -100
+    embedding_size: 256
+    pretrained_path: /content/ckpt/mf_amazon_d256.pth
+
+  qformer:
+    d_q: 128
+    n_query: 4                # L; ablate 1 / 2 / 4 / 8
+    n_layers: 2
+    n_heads: 4
+    dropout: 0.1
+    use_slot_prior: True
+    use_candidate: True       # False = `-candidate` ablation (no FiLM)
+    match_llm_norm: True      # False = `-norm-match` ablation
+    memory:
+      # History slots are per-row and point-in-time: the sample's own `his`
+      # column, i.e. exactly what CoLLM renders into <ItemTitleList>. Nothing is
+      # precomputed for them. `train_only` restores the old per-user train-split
+      # lookup -- that is the `-pit-history` ablation row.
+      history_source: pit         # pit | train_only
+      # CoLLM caps history at 10 only because it renders it as TEXT; memory slots
+      # cost zero prompt tokens, so this can go to 50 (<= pit_hist_width below).
+      # ML-1M mean history: ~38 train / ~75 test. Search {10, 20, 50}.
+      k_hist: 50
+      k_neighbor: 8
+      k_genre: 3
+      k_cluster: 3
+      memory_index_path: /content/ckpt/memory_index_amazon.pkl
+  loss:
+    lambda_rank: 0.5
+    lambda_cf: 0.2
+    lambda_div: 0.1
+    lambda_attn: 0.05
+    lambda_var: 0.05
+    lambda_align: 0.0
+    rank_score: yes_minus_no  # s = logit(Yes) - logit(No) for L_rank
+
+datasets:
+  amazon_ood_qf:
+    path: /content/data/book/
+    data_type: default
+    pit_hist_width: 50          # width of the emitted history; must be >= k_hist
+    build_info:
+      storage: /content/data/book/
+
+run:
+  task: rec_qformer
+  runner: rec_runner_qformer
+  lr_sched: "linear_warmup_cosine_lr_scaled"
+  init_lr: 1e-4               # stage 3 = stage-2 lrs / 10
+  min_lr: 1e-5
+  warmup_lr: 1e-5
+  mode: 'v2'
+  select_metric: uauc
+  grad_clip: 1.0
+
+  lr_scale:                   # effective lr = init_lr * scale
+    qformer: 1.0              # 1e-4
+    proto: 1.0                # 1e-4
+    rec: 0.1                  # 1e-5
+    lora: 0.1                 # 1e-5
+
+  user_grouped_sampler: True  # required by L_rank; False ablates it cleanly
+  users_per_batch: 8          # U
+  rows_per_user: 6            # m  -> real batch = 48, no grad accumulation
+  strict_batch: True
+
+  weight_decay: 1e-3
+  max_epoch: 10               # 10 x 400 iters x 48 rows ~ 1 real epoch
+  iters_per_epoch: 400
+  batch_size_train: 48        # ignored while user_grouped_sampler is on
+  batch_size_eval: 64
+  num_workers: 4
+  warmup_steps: 200           # 5% of 4000 total iters
+  empty_cache_freq: 0
+
+  seed: 42
+  output_dir: /content/logs/stage3_amazon
+
+  amp: True
+  resume_ckpt_path: null
+
+  evaluate: False
+  train_splits: ["train"]
+  valid_splits: ["valid"]
+  test_splits: ["test", "valid"]
+
+  device: "cuda"
+  world_size: 1
+  dist_url: "env://"
+  distributed: False

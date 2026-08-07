@@ -1,0 +1,18 @@
+# Verified combination for CoLLM-QFormer. The first three pins are load-bearing:
+#  transformers 4.28 -- CoLLM vendors modeling_llama.py against this API
+#  peft 0.4.0        -- CoLLM imports prepare_model_for_int8_training (gone in peft>=0.10)
+#  scikit-learn 1.2.2-- newer sklearn makes CoLLM's uAUC_me return NaN (see README)
+transformers==4.28.0
+peft==0.4.0
+scikit-learn==1.2.2
+omegaconf==2.3.0
+webdataset==0.2.48
+timm==0.6.13
+sentencepiece
+decord
+iopath
+opencv-python-headless
+numpy<2
+pandas
+scipy
+# torch / torchvision: use the build that matches your CUDA (Colab's preinstalled is fine)

@@ -1,0 +1,493 @@
+#!/usr/bin/env python
+"""End-to-end integration test with a TINY randomly-initialised LLaMA.
+
+Exercises the parts the CPU smoke test cannot: registry wiring, the real
+``LlamaTokenizer`` splicing path, LoRA freezing, ``forward_v2`` / eval, the
+optimizer param grouping, the dataset/builder and the task's evaluation loop --
+without needing the 13 GB Vicuna weights.
+
+Prereqs: a CoLLM checkout on ``COLLM_ROOT``, a ``memory_index`` pkl, an MF
+checkpoint, and a CoLLM-format data dir. The tiny LLaMA is created on the fly.
+
+    python scripts/integration_test.py \
+        --data_dir ... --mf_ckpt ... --memory_index ... --work_dir /tmp/itest
+"""
+
+import argparse
+import os
+import sys
+import types
+
+import numpy as np
+import torch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, ".."))
+sys.path.insert(0, ROOT)
+
+# `minigpt4.datasets.data_utils` imports decord purely for video datasets we
+# never touch; stub it so the test does not need the wheel.
+if "decord" not in sys.modules:
+    try:
+        import decord  # noqa: F401
+    except ImportError:
+        import importlib.machinery
+
+        stub = types.ModuleType("decord")
+        # transformers' import_utils calls find_spec("decord"), which raises if
+        # __spec__ is None
+        stub.__spec__ = importlib.machinery.ModuleSpec("decord", None)
+        stub.bridge = types.SimpleNamespace(set_bridge=lambda *a, **k: None)
+        stub.VideoReader = object
+        sys.modules["decord"] = stub
+
+_failures = []
+
+
+def check(name, cond, extra=""):
+    print(f"[{'  ok  ' if cond else ' FAIL '}] {name} {extra}")
+    if not cond:
+        _failures.append(name)
+
+
+def make_tiny_llama(path, tokenizer_repo="hf-internal-testing/llama-tokenizer"):
+    from transformers import LlamaConfig, LlamaForCausalLM, LlamaTokenizer
+
+    if os.path.exists(os.path.join(path, "config.json")):
+        return path
+    os.makedirs(path, exist_ok=True)
+    cfg = LlamaConfig(
+        vocab_size=32000, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=2, num_attention_heads=4, max_position_embeddings=2048,
+    )
+    LlamaForCausalLM(cfg).save_pretrained(path)
+    LlamaTokenizer.from_pretrained(tokenizer_repo, use_fast=False).save_pretrained(path)
+    print(f"built tiny LLaMA at {path}")
+    return path
+
+
+def build_cfg(args, llama_path, stage):
+    from omegaconf import OmegaConf
+
+    freeze_lora = stage == 2
+    return OmegaConf.create({
+        "model": {
+            "arch": "mini_gpt4rec_qformer", "model_type": "pretrain_vicuna",
+            "freeze_rec": stage == 2, "freeze_proj": False, "freeze_lora": freeze_lora,
+            "max_txt_len": 1024, "proj_token_num": 1, "proj_drop": 0, "proj_mid_times": 2,
+            "end_sym": "###", "prompt_path": os.path.join(ROOT, "prompts/qformer_movie.txt"),
+            "prompt_template": "{}", "llama_model": llama_path,
+            "ans_type": "v2", "rec_model": "MF", "n_titles_kept": 0, "diag_log_freq": 0,
+            "lora_config": {"use_lora": True, "r": 8, "alpha": 16,
+                            "target_modules": ["q_proj", "v_proj"], "dropout": 0.05},
+            "rec_config": {"user_num": args.user_num, "item_num": args.item_num,
+                           "embedding_size": 256, "pretrained_path": args.mf_ckpt},
+            "qformer": {"d_q": 32, "n_query": 4, "n_layers": 2, "n_heads": 4, "dropout": 0.1,
+                        "use_slot_prior": True, "use_candidate": True, "match_llm_norm": True,
+                        "memory": {"history_source": "pit", "k_hist": 50, "k_neighbor": 8,
+                                   "k_genre": 3, "k_cluster": 3,
+                                   "memory_index_path": args.memory_index}},
+            "loss": {"lambda_rank": 0.5, "lambda_cf": 0.2, "lambda_div": 0.1,
+                     "lambda_attn": 0.05, "lambda_var": 0.05, "lambda_align": 0.01,
+                     "rank_score": "yes_minus_no"},
+        },
+        "run": {"task": "rec_qformer", "runner": "rec_runner_qformer",
+                "lr_sched": "linear_warmup_cosine_lr_scaled", "init_lr": 1e-3, "min_lr": 8e-5,
+                "warmup_lr": 1e-5, "mode": "v2", "select_metric": "uauc", "grad_clip": 1.0,
+                "lr_scale": {"qformer": 1.0, "proto": 1.0, "rec": 0.1, "lora": 0.1},
+                "user_grouped_sampler": True, "users_per_batch": 4, "rows_per_user": 4,
+                "strict_batch": False, "weight_decay": 1e-3, "max_epoch": 1,
+                "iters_per_epoch": 3, "batch_size_train": 16, "batch_size_eval": 16,
+                "num_workers": 0, "warmup_steps": 2, "seed": 42,
+                "output_dir": os.path.join(args.work_dir, f"out_stage{stage}"),
+                "amp": False, "resume_ckpt_path": None, "evaluate": False,
+                "train_splits": ["train"], "valid_splits": ["valid"],
+                "test_splits": ["test"], "device": "cpu", "world_size": 1,
+                "dist_url": "env://", "distributed": False},
+        "datasets": {"movie_ood_qf": {"path": args.data_dir, "data_type": "default",
+                                      "pit_hist_width": 50,
+                                      "build_info": {"storage": args.data_dir}}},
+    })
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", required=True)
+    ap.add_argument("--mf_ckpt", required=True)
+    ap.add_argument("--memory_index", required=True)
+    ap.add_argument("--work_dir", required=True)
+    ap.add_argument("--collm_root", default=os.environ.get("COLLM_ROOT"))
+    args = ap.parse_args()
+    assert args.collm_root, "set COLLM_ROOT or pass --collm_root"
+    sys.path.insert(0, os.path.abspath(args.collm_root))
+    os.makedirs(args.work_dir, exist_ok=True)
+
+    import pandas as pd
+
+    ids = [pd.read_pickle(os.path.join(args.data_dir, f"{s}_ood2.pkl"))[["uid", "iid"]]
+           for s in ["train", "valid", "test"]]
+    args.user_num = int(max(d.uid.max() for d in ids)) + 1
+    args.item_num = int(max(d.iid.max() for d in ids)) + 1
+    del ids
+
+    from minigpt4.common.registry import registry  # noqa: F401
+    from minigpt4.datasets.data_utils import prepare_sample
+
+    import qformerrec.datasets.rec_datasets_qformer as dsmod  # noqa: F401
+    import qformerrec.models.minigpt4rec_qformer as mmod  # noqa: F401
+    import qformerrec.runners.runner_qformer as rmod  # noqa: F401
+    import qformerrec.tasks.rec_qformer_task as tmod  # noqa: F401
+
+    print("\n=== registry ===")
+    for kind, name in [("model", "mini_gpt4rec_qformer"), ("task", "rec_qformer"),
+                       ("runner", "rec_runner_qformer"), ("builder", "movie_ood_qf"),
+                       ("builder", "amazon_ood_qf"),
+                       ("lr_scheduler", "linear_warmup_cosine_lr_scaled")]:
+        getter = getattr(registry, f"get_{kind}_class")
+        check(f"{kind} '{name}' registered", getter(name) is not None)
+
+    llama_path = make_tiny_llama(os.path.join(args.work_dir, "tinyllama"))
+
+    print("\n=== dataset / builder ===")
+    ds = dsmod.RecOODDataset(ann_paths=[os.path.join(args.data_dir, "test")])
+    ds_warm = dsmod.RecOODDataset(ann_paths=[os.path.join(args.data_dir, "test=warm")])
+    ds_cold = dsmod.RecOODDataset(ann_paths=[os.path.join(args.data_dir, "test=cold")])
+    check("warm + cold partition the test split",
+          len(ds_warm) + len(ds_cold) == len(ds),
+          f"({len(ds_warm)} + {len(ds_cold)} == {len(ds)})")
+    check("warm split is non-trivial", 0 < len(ds_warm) < len(ds))
+    s0 = ds[0]
+    check("sample has the fields the model needs",
+          all(k in s0 for k in ["UserID", "TargetItemID", "TargetItemTitle",
+                                "InteractedItemTitles", "label"]), str(sorted(s0)))
+    check("target title is quoted", s0["TargetItemTitle"].startswith('"'))
+
+    print("\n=== point-in-time history field ===")
+    from qformerrec.models.qformer_cie import HIST_PAD
+    check("dataset emits PitHistItems", "PitHistItems" in s0, str(sorted(s0)))
+    check("PitHistItems width == pit_hist_width",
+          s0["PitHistItems"].shape == (ds.pit_hist_width,), str(s0["PitHistItems"].shape))
+    raw = ds.annotation["InteractedItemIDs"].iloc[0]
+    expect = [int(x) for x in raw if int(x) != 0][-ds.pit_hist_width:][::-1]
+    got = [int(x) for x in s0["PitHistItems"] if int(x) != HIST_PAD]
+    check("PitHistItems is the row's own history, most-recent-first",
+          got == expect, f"got[:4]={got[:4]} expect[:4]={expect[:4]}")
+    check("index-0 padding is dropped", 0 not in got)
+    check("padding is on the right (recency rank == column index)",
+          all(x == HIST_PAD for x in s0["PitHistItems"][len(got):]))
+    # the whole point of the change: on the TEST split the history must be
+    # dominated by valid/test-period items, not train ones
+    import pandas as _pd
+    _tr = _pd.read_pickle(os.path.join(args.data_dir, "train_ood2.pkl"))
+    _va = _pd.read_pickle(os.path.join(args.data_dir, "valid_ood2.pkl"))
+    tr_pos = set(zip(_tr[_tr.label == 1].uid, _tr[_tr.label == 1].iid))
+    va_pos = set(zip(_va[_va.label == 1].uid, _va[_va.label == 1].iid))
+    prov = {"train": 0, "valid_or_later": 0}
+    for r in range(0, len(ds), max(1, len(ds) // 800)):
+        smp = ds[r]
+        for i in smp["PitHistItems"][:10]:
+            i = int(i)
+            if i == HIST_PAD:
+                continue
+            u = int(smp["UserID"])
+            prov["train" if (u, i) in tr_pos else "valid_or_later"] += 1
+    tot = sum(prov.values())
+    frac_train = prov["train"] / max(tot, 1)
+    check("test-split history is NOT dominated by train items (pit took effect)",
+          frac_train < 0.30,
+          f"train={frac_train:.1%} valid_or_later={1 - frac_train:.1%} "
+          f"(expect ~9% train for ML-1M test at k=10)")
+    del _tr, _va
+
+    # ---------------------------------------------------------------- stage 2
+    for stage in (2, 3):
+        print(f"\n=== stage {stage}: build / forward / backward / eval ===")
+        cfg_full = build_cfg(args, llama_path, stage)
+        if stage == 3:
+            cfg_full.model.ckpt = os.path.join(args.work_dir, "stage2_ckpt.pth")
+        model = mmod.MiniGPT4RecQFormer.from_config(cfg_full.model)
+        model.set_mode("v2")
+        model = model.float()
+
+        trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+        has_lora = any("lora_" in n for n in trainable)
+        check(f"stage {stage}: LoRA {'frozen' if stage == 2 else 'trainable'}",
+              has_lora == (stage == 3), f"(lora trainable={has_lora})")
+        check(f"stage {stage}: MF {'frozen' if stage == 2 else 'trainable'}",
+              any(n.startswith("rec_encoder") for n in trainable) == (stage == 3))
+        for comp in ["memory_encoder", "query_gen", "qformer", "pref_proj", "cf_head",
+                     "llama_proj"]:
+            check(f"stage {stage}: {comp} trainable",
+                  any(n.startswith(comp) for n in trainable))
+        # peft rewrites q_proj/v_proj *inside* llama_model, so LoRA tensors are
+        # also reachable as `llama_model.*`; only the base weights must be frozen
+        base_llm_trainable = [n for n in trainable
+                              if n.startswith("llama_model") and "lora_" not in n]
+        check(f"stage {stage}: base LLM weights frozen", not base_llm_trainable,
+              f"{base_llm_trainable[:3]}")
+
+        # a real batch through the real tokenizer
+        from torch.utils.data import DataLoader
+
+        from qformerrec.datasets.samplers import UserGroupedBatchSampler
+        train_ds = dsmod.RecOODDataset(ann_paths=[os.path.join(args.data_dir, "train")])
+        bs = UserGroupedBatchSampler(train_ds.annotation["UserID"].values,
+                                     train_ds.annotation["label"].values,
+                                     n_users_per_batch=4, n_per_user=4, seed=0)
+        loader = DataLoader(train_ds, batch_sampler=bs, collate_fn=train_ds.collater)
+        batch = prepare_sample(next(iter(loader)), cuda_enabled=False)
+        check(f"stage {stage}: batch is 16 rows", batch["UserID"].shape[0] == 16)
+
+        # splicing: exact <unk> accounting and the L + 2 soft tokens
+        prompt = model.prompt_list[0]
+        enc = model.encode_recdata_qformer(batch)
+        embeds, atts, n_tok = model.recprompt_wrap_qformer(enc, batch, prompt)
+        n_soft = model.n_query + 2 * model.proj_token_num
+        check(f"stage {stage}: pref tokens are (B, L, d_llm)",
+              tuple(enc["PrefTokens"].shape) == (16, 4, model.llama_model.config.hidden_size))
+        check(f"stage {stage}: spliced embeds finite", bool(torch.isfinite(embeds).all()))
+        check(f"stage {stage}: attention mask matches embeds",
+              atts.shape[:2] == embeds.shape[:2])
+        check(f"stage {stage}: mean prompt length is short (< 110 tokens)",
+              float(n_tok) < 110, f"({float(n_tok):.1f} tokens, n_soft={n_soft})")
+        # the soft embeddings must actually be present in the spliced sequence
+        unk_id = model.llama_tokenizer.unk_token_id
+        for glue in ("", "."):
+            toks = model.llama_tokenizer(
+                [prompt.replace("<PrefTokens>", glue.join(["<unk>"] * 4))
+                       .replace("<UserID>", "<unk>").replace("<TargetItemID>", "<unk>")
+                       .replace("<TargetItemTitle>", batch["TargetItemTitle"][0])],
+                add_special_tokens=False)
+            got = sum(1 for t in toks.input_ids[0] if t == unk_id)
+            check(f"stage {stage}: <unk> count == L+2 with glue={glue!r}",
+                  got == n_soft, f"(got {got}, want {n_soft})")
+        # every row must carry the same number of soft slots, or the row-major
+        # scatter silently misaligns
+        counts = {int((r == unk_id).sum()) for r in
+                  model.llama_tokenizer(
+                      [prompt.replace("<PrefTokens>", "<unk>" * 4)
+                             .replace("<UserID>", "<unk>").replace("<TargetItemID>", "<unk>")
+                             .replace("<TargetItemTitle>", t)
+                       for t in batch["TargetItemTitle"]],
+                      return_tensors="pt", padding="longest",
+                      add_special_tokens=False).input_ids}
+        check(f"stage {stage}: soft-slot count is identical on every row",
+              counts == {n_soft}, str(counts))
+
+        # forward / backward
+        out = model.forward_v2(batch)
+        check(f"stage {stage}: forward loss is finite scalar",
+              torch.isfinite(out["loss"]) and out["loss"].ndim == 0, f"loss={float(out['loss']):.4f}")
+        out["loss"].backward()
+        grads = {n: p for n, p in model.named_parameters() if p.requires_grad}
+        no_grad = [n for n, p in grads.items() if p.grad is None]
+        nan_grad = [n for n, p in grads.items() if p.grad is not None
+                    and not torch.isfinite(p.grad).all()]
+        check(f"stage {stage}: every trainable param got a gradient",
+              not no_grad, f"missing={no_grad[:5]}")
+        check(f"stage {stage}: no NaN/Inf gradients", not nan_grad, f"nan={nan_grad[:5]}")
+        reached = sum(1 for p in grads.values() if p.grad is not None and float(p.grad.abs().sum()) > 0)
+        check(f"stage {stage}: gradients are non-zero", reached > 0.5 * len(grads),
+              f"({reached}/{len(grads)})")
+
+        # eval path
+        model.eval()
+        ev = model.generate_for_samples(batch)
+        check(f"stage {stage}: eval returns logits + loss",
+              "logits" in ev and "loss" in ev and ev["logits"].shape[0] == 16)
+        check(f"stage {stage}: eval extras present",
+              "n_prompt_tokens" in ev and "token_cosine" in ev,
+              f"cos={float(ev['token_cosine']):.4f}")
+
+        # a full optimizer step through the runner's grouping
+        if stage == 2:
+            print(f"\n=== stage {stage}: optimizer grouping + 2 real steps ===")
+            import minigpt4.tasks as tasks
+            from minigpt4.common.config import Config
+
+            # CPU-only shim: CoLLM's PrefetchLoader constructs a
+            # torch.cuda.Stream and calls .cuda() on every batch, neither of
+            # which exists without a GPU. Identity-wrap it for this test; on the
+            # real A100 run the genuine PrefetchLoader is used.
+            if not torch.cuda.is_available():
+                class CPULoader:
+                    """PrefetchLoader's interface without the CUDA stream."""
+
+                    def __init__(self, loader):
+                        self.loader = loader
+
+                    def __iter__(self):
+                        return iter(self.loader)
+
+                    def __len__(self):
+                        return len(self.loader)
+
+                    def __next__(self):     # MultiIterLoader asserts this exists
+                        pass
+
+                    def __getattr__(self, name):
+                        return self.loader.__getattribute__(name)
+
+                rmod.PrefetchLoader = CPULoader
+
+            class _A:  # minimal stand-in for argparse output
+                options = None
+                cfg_path = os.path.join(args.work_dir, "itest_cfg.yaml")
+
+            from omegaconf import OmegaConf
+            OmegaConf.save(cfg_full, _A.cfg_path)
+            cfg = Config(_A())
+            task = tasks.setup_task(cfg)
+            datasets = task.build_datasets(cfg)
+            model2 = mmod.MiniGPT4RecQFormer.from_config(cfg.model_cfg).float()
+            runner = registry.get_runner_class("rec_runner_qformer")(
+                cfg=cfg, job_id="itest", task=task, model=model2, datasets=datasets
+            )
+            opt = runner.optimizer
+            by_group = {}
+            for g in opt.param_groups:
+                by_group.setdefault(g["group"], []).append(g["lr_scale"])
+            check("optimizer has qformer + proto groups",
+                  {"qformer", "proto"} <= set(by_group), str(sorted(by_group)))
+            check("proto group carries lr_scale 1.0", all(s == 1.0 for s in by_group["proto"]))
+            check("stage 2 has no lora group (frozen)", "lora" not in by_group)
+            check("stage 2 has no rec group (frozen)", "rec" not in by_group)
+
+            sched = runner.lr_scheduler
+            sched.step(cur_epoch=0, cur_step=2)
+            lrs = {g["group"]: g["lr"] for g in opt.param_groups}
+            check("scheduler applies lr_scale per group",
+                  abs(lrs["qformer"] / max(lrs.get("proto", lrs["qformer"]), 1e-12) - 1.0) < 1e-9)
+
+            runner.set_model_mode("v2")
+            before = model2.query_gen.Q0.detach().clone()
+            stats = runner.train_epoch(0)
+            check("training epoch ran", "loss" in stats, str(stats))
+            check("Q0 actually moved", not torch.allclose(before, model2.query_gen.Q0.detach()))
+            check("no NaN parameters after the step",
+                  all(torch.isfinite(p).all() for p in model2.parameters()))
+
+            # evaluation through the task (the path that used to crash single-GPU)
+            print("\n=== task evaluation (single process) ===")
+            val = runner.eval_epoch(split_name="valid", cur_epoch=0, skip_reload=True)
+            for k in ["auc", "uauc", "agg_metrics", "mean_prompt_tokens", "ms_per_sample",
+                      "token_cosine_offdiag", "uauc_users_scored", "uauc_users_skipped"]:
+                check(f"eval result has '{k}'", k in val, f"={val.get(k)}")
+            check("agg_metrics == uauc (UAUC-based selection)",
+                  val["agg_metrics"] == val["uauc"])
+            check("auc/uauc are finite and in (0, 1)",
+                  np.isfinite(val["auc"]) and np.isfinite(val["uauc"])
+                  and 0 < val["auc"] < 1 and 0 < val["uauc"] < 1,
+                  f"auc={val['auc']:.4f} uauc={val['uauc']:.4f}")
+            # the regression this guards: CoLLM's uAUC_me returns nan on modern
+            # sklearn because single-class users are no longer skipped
+            from qformerrec.tasks.rec_qformer_task import uauc_score
+            from minigpt4.tasks.rec_base_task import uAUC_me
+            import warnings
+            rng = np.random.RandomState(0)
+            uu = np.array([1, 1, 2, 2, 3, 3, 4])       # user 2 = all-positive, user 4 = 1 row
+            yy = np.array([1, 0, 1, 1, 0, 1, 1])
+            ss = rng.randn(7)
+            ours, st = uauc_score(uu, ss, yy)
+            check("uauc_score skips single-class and single-row users",
+                  st["n_scored"] == 2 and st["n_single_class"] == 1
+                  and st["n_single_row"] == 1 and np.isfinite(ours), str(st))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                legacy = uAUC_me(uu, ss, yy)[0]
+            print(f"        (CoLLM uAUC_me on this input: {legacy}; ours: {ours:.4f})")
+
+            # diagnostics + checkpoint for stage 3
+            # train_epoch already flushed (and reset) the diagnostics, so do one
+            # more forward to repopulate them before checking the summary
+            model2.train()
+            model2.forward_v2(batch)["loss"].backward()
+            summ = model2.log_qformer_diagnostics(output_dir=str(runner.output_dir), tag="itest")
+            check("diagnostics summary produced", "token_cosine_offdiag" in summ
+                  and "pref_token_norm" in summ and "hist_unk_rate" in summ,
+                  str({k: (round(v, 4) if isinstance(v, float) else v)
+                       for k, v in summ.items()}))
+            check("diagnostics file written",
+                  os.path.exists(os.path.join(runner.output_dir, "qformer_diagnostics.jsonl")))
+            sd = {n: p for n, p in model2.state_dict().items()
+                  if not n.startswith(("llama_model.", "llama_model_lora."))}
+            torch.save({"model": sd}, os.path.join(args.work_dir, "stage2_ckpt.pth"))
+
+    # ------------------------------------------------------ ablation configs
+    print("\n=== every ablation row from the spec builds + trains one step ===")
+    from omegaconf import OmegaConf
+
+    ablations = {
+        "full": {},
+        "-memory": {"qformer.memory.k_hist": 0, "qformer.memory.k_neighbor": 0,
+                    "qformer.memory.k_genre": 0, "qformer.memory.k_cluster": 0},
+        "-hist": {"qformer.memory.k_hist": 0},
+        "-pit-history": {"qformer.memory.history_source": "train_only",
+                         "qformer.memory.k_hist": 10},
+        "k_hist=10": {"qformer.memory.k_hist": 10},
+        "k_hist=20": {"qformer.memory.k_hist": 20},
+        "-neighbor": {"qformer.memory.k_neighbor": 0},
+        "-genre": {"qformer.memory.k_genre": 0},
+        "-cluster": {"qformer.memory.k_cluster": 0},
+        "-candidate": {"qformer.use_candidate": False},
+        "L=1": {"qformer.n_query": 1},
+        "L=8": {"qformer.n_query": 8},
+        "-anticollapse": {"loss.lambda_div": 0.0, "loss.lambda_attn": 0.0,
+                          "loss.lambda_var": 0.0},
+        "-rank": {"loss.lambda_rank": 0.0},
+        "-norm-match": {"qformer.match_llm_norm": False},
+        "-slot-prior": {"qformer.use_slot_prior": False},
+        "+titles": {"n_titles_kept": 3,
+                    "prompt_path": os.path.join(ROOT, "prompts/qformer_movie_titles.txt")},
+        "terse-prompt": {"prompt_path": os.path.join(ROOT, "prompts/qformer_movie_terse.txt")},
+        "n_layers=1": {"qformer.n_layers": 1},
+        "n_layers=3": {"qformer.n_layers": 3},
+        "dot-glue": {"soft_token_glue": "."},
+    }
+    for name, overrides in ablations.items():
+        mcfg = OmegaConf.create(OmegaConf.to_container(build_cfg(args, llama_path, 2).model))
+        for k, v in overrides.items():
+            OmegaConf.update(mcfg, k, v, merge=True)
+        try:
+            m = mmod.MiniGPT4RecQFormer.from_config(mcfg).float()
+            m.set_mode("v2")
+            out = m.forward_v2(batch)
+            out["loss"].backward()
+            m.eval()
+            ev = m.generate_for_samples(batch)
+            n_slots = m.memory_encoder.n_slots
+            ok = (torch.isfinite(out["loss"]) and torch.isfinite(ev["logits"]).all()
+                  and not any(p.grad is not None and not torch.isfinite(p.grad).all()
+                              for p in m.parameters()))
+            check(f"ablation '{name}'", bool(ok),
+                  f"L={m.n_query} slots={n_slots} "
+                  f"hist={m.memory_encoder.history_source}/{m.memory_encoder.k_hist} "
+                  f"loss={float(out['loss']):.4f} "
+                  f"tokens={float(ev['n_prompt_tokens']):.1f}")
+        except Exception as e:  # noqa: BLE001
+            check(f"ablation '{name}'", False, f"{type(e).__name__}: {str(e)[:160]}")
+        del m
+
+    print("\n=== k_hist > pit_hist_width must fail loudly ===")
+    mcfg = OmegaConf.create(OmegaConf.to_container(build_cfg(args, llama_path, 2).model))
+    OmegaConf.update(mcfg, "qformer.memory.k_hist", 80, merge=True)
+    try:
+        m = mmod.MiniGPT4RecQFormer.from_config(mcfg).float()
+        m.set_mode("v2")
+        m.forward_v2(batch)
+        check("k_hist beyond the dataset width raises", False, "it silently accepted 80")
+    except AssertionError as e:
+        check("k_hist beyond the dataset width raises", "pit_hist_width" in str(e),
+              str(e)[:120])
+
+    print("\n" + "=" * 60)
+    if _failures:
+        print(f"FAILED ({len(_failures)}):")
+        for f in _failures:
+            print("  -", f)
+        sys.exit(1)
+    print("integration test passed")
+
+
+if __name__ == "__main__":
+    main()
