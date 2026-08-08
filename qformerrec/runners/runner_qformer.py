@@ -35,6 +35,10 @@ from qformerrec.compat import attach_file_log, enable_live_output
 from qformerrec.datasets.samplers import UserGroupedBatchSampler
 
 PROTO_KEYS = ("memory_encoder.genre_proto", "memory_encoder.cluster_proto")
+# CoLLM's <UserID>/<TargetItemID> MLP. Own group because it is ~11.2M freshly
+# initialised parameters writing directly into the LLM embedding space, against
+# ~800k for the Q-Former core -- so it is the part most likely to need a smaller lr.
+PROJ_KEYS = ("llama_proj",)
 
 
 class _CPULoader:
@@ -262,6 +266,7 @@ class RecRunnerQFormer(RecRunnerBase):
         scales = cfg.get("lr_scale", {}) or {}
         scale = {
             "qformer": float(scales.get("qformer", 1.0)),
+            "proj": float(scales.get("proj", 1.0)),
             "proto": float(scales.get("proto", 1.0)),
             "rec": float(scales.get("rec", 0.1)),
             "lora": float(scales.get("lora", 0.1)),
@@ -279,6 +284,8 @@ class RecRunnerQFormer(RecRunnerBase):
                 g = "lora"
             elif any(n.startswith(k) for k in PROTO_KEYS):
                 g = "proto"
+            elif any(n.startswith(k) for k in PROJ_KEYS):
+                g = "proj"
             else:
                 g = "qformer"
             no_wd = p.ndim < 2 or "bias" in n or "ln" in n or "bn" in n or "norm" in n.lower()

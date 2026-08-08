@@ -90,8 +90,11 @@ run:
   task: rec_qformer
   runner: rec_runner_qformer
   lr_sched: "linear_warmup_cosine_lr_scaled"
-  init_lr: 1e-3               # Q-Former / projector / prototypes
-  min_lr: 8e-5
+  # 1e-3 (the spec's value) diverges here: the only healthy epoch was the one still
+  # in warmup at ~2.6e-4 mean lr, after which token cosine spiked to 0.82 and both
+  # UAUC and validation loss went the wrong way. See runsheet 5.3.
+  init_lr: 3e-4               # Q-Former / projector / prototypes
+  min_lr: 3e-5
   warmup_lr: 1e-5
   mode: 'v2'
   select_metric: uauc
@@ -106,8 +109,9 @@ run:
   fp32_trainable: True
 
   lr_scale:                   # effective lr = init_lr * scale
-    qformer: 1.0              # 1e-3
-    proto: 1.0                # 1e-3
+    qformer: 1.0
+    proj: 1.0                 # <UserID>/<TargetItemID> MLP; try 0.3 if it destabilises
+    proto: 1.0
     rec: 0.1                  # 1e-4  (only matters if freeze_rec: False)
     lora: 0.1                 # frozen in stage 2
 

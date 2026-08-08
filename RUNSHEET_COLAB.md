@@ -680,6 +680,39 @@ the first one runs:
 !tail -f /content/logs/stage2_ml1m/*/train.log     # or tail -20 for a snapshot
 ```
 
+**The stage-2 divergence signature, and how it was diagnosed.** An observed run:
+
+| epoch | mean lr | UAUC | val loss | `token_cos` |
+|---|---|---|---|---|
+| 0 | **2.6e-04** | **0.6451** ← best | 0.6550 | 0.1576 healthy |
+| 1 | 7.5e-04 | 0.6274 | 0.6967 | **0.8171 collapsed** |
+| 2 | 9.9e-04 | 0.6090 | 0.7050 | 0.5032 |
+| 3 | 9.8e-04 | 0.6010 | 0.7826 | 0.3864 |
+
+Three things make this a diverging run rather than an expected stage-2 dip or overfitting:
+
+* the best epoch is the *only* one still inside warmup, i.e. the only one at a low lr;
+* **validation loss rises monotonically** — overfitting would plateau the loss while AUC
+  drifts, and 9 600 samples (0.28 real epochs) is far too early to overfit 33 891 rows;
+* `token_cos` jumps to **0.82** exactly when the lr triples. That is the L tokens collapsing
+  onto one vector, and it crosses the 0.6 line in the table below. `lambda_div` then drags it
+  back (0.82 → 0.50 → 0.39), but the metric never recovers.
+
+So `init_lr: 1e-3` — the spec's stage-2 value — is too high in practice. The configs now ship
+`3e-4` / `min_lr: 3e-5`, which is where the one healthy epoch actually ran. If `token_cos`
+still exceeds 0.6 after that, follow the spec's own escalation and raise `lambda_div` to 0.3
+before touching anything else. If it destabilises again, the next suspect is `llama_proj`:
+11.2M freshly-initialised parameters writing straight into embedding space against ~800k for
+the Q-Former core, so it has its own lr group — try `--options run.lr_scale.proj=0.3`.
+
+To rule out overfitting rather than assuming, compare the *train* loss against the
+validation loss (both rising = diverging; train falling while valid rises = overfitting):
+
+```python
+!grep "train epoch" /content/logs/stage2_ml1m/*/train.log | tail -5
+!grep "Averaged stats" /content/logs/stage2_ml1m/*/train.log | tail -5
+```
+
 | Watch | Healthy | If not |
 |---|---|---|
 | `pref_token_norm` vs `llm_emb_norm` | within 2× | the RMS matching is off — soft prompt will do nothing |
@@ -959,6 +992,7 @@ overhead is what makes Drive-backed runs slow.
 | `ValueError: Attempting to unscale FP16 gradients` | Vicuna loads in fp16 and peft ≥0.5 casts LoRA adapters to the base dtype, so the only trainable tensors in stage 1/3 are fp16 — `GradScaler` rejects those in `step()` as well as `unscale_()` | keep `run.fp32_trainable: True` (the default): the runner casts trainable params to fp32 and leaves the backbone fp16. CoLLM avoided this only by pinning peft 0.4.0, which created fp32 adapters |
 | `loss=nan`, all params finite, log mentions `LOAD REPORT` or `v4.50` | transformers 5.x corrupting the vendored LLaMA's rotary buffers | `pip install "transformers==4.36.2" "peft==0.9.0"` **and restart the runtime**. `LOAD REPORT` appears only in 5.x, so it is a reliable tell |
 | run keeps going long after it peaked | patience is 20 *validations* = `20 x iters_per_epoch` steps | `--options run.patience=5` while sweeping; the log now shows `no improvement for N/20` |
+| stage-2 UAUC best at epoch 0, then falls, with `token_cos` spiking > 0.6 and val loss rising | `init_lr` too high — diverging, not overfitting | configs now ship `3e-4`; then `lambda_div: 0.3`; then `run.lr_scale.proj=0.3` |
 | stage 2 scores below stage 1's best | expected: stage 2 drops the history titles, freezes LoRA, and starts with random soft tokens | compare against stage 1 evaluated *on the short prompt* (§5.2), and run stage 3 before judging |
 | stage-1 AUC ~0.50 at the first validation | expected — that is after `iters_per_epoch x batch` = ~1 600 samples, and LoRA's `lora_B` starts at zero so the adapter contributes nothing yet | judge the trend and `best_epoch`, not epoch 0 |
 | stage-1 AUC never leaves ~0.50 and the loss is flat | too little training, or `init_lr` too high for LoRA | you halved the batch without raising `max_epoch` (see §5.1); then try `init_lr: 3e-4` |

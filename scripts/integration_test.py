@@ -338,8 +338,11 @@ def main():
             by_group = {}
             for g in opt.param_groups:
                 by_group.setdefault(g["group"], []).append(g["lr_scale"])
-            check("optimizer has qformer + proto groups",
-                  {"qformer", "proto"} <= set(by_group), str(sorted(by_group)))
+            check("optimizer has qformer + proj + proto groups",
+                  {"qformer", "proj", "proto"} <= set(by_group), str(sorted(by_group)))
+            check("llama_proj is its own lr group (so it can be scaled down)",
+                  "proj" in by_group and all(s == 1.0 for s in by_group["proj"]),
+                  f"proj scales={by_group.get('proj')}")
             check("proto group carries lr_scale 1.0", all(s == 1.0 for s in by_group["proto"]))
             check("stage 2 has no lora group (frozen)", "lora" not in by_group)
             check("stage 2 has no rec group (frozen)", "rec" not in by_group)

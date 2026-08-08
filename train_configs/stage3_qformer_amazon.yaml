@@ -102,8 +102,9 @@ run:
   fp32_trainable: True
 
   lr_scale:                   # effective lr = init_lr * scale
-    qformer: 1.0              # 1e-4
-    proto: 1.0                # 1e-4
+    qformer: 1.0
+    proj: 1.0                 # <UserID>/<TargetItemID> MLP; try 0.3 if it destabilises
+    proto: 1.0
     rec: 0.1                  # 1e-5
     lora: 0.1                 # 1e-5
 
