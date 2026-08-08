@@ -58,7 +58,10 @@ run:
   min_lr: 1e-5
   warmup_lr: 1e-6
   mode: 'v2'
-  select_metric: uauc          # checkpoint on validation UAUC, not AUC
+  select_metric: uauc
+  # early stop after this many validations without a select_metric improvement.
+  # Units are VALIDATIONS, so patience x iters_per_epoch steps. 0/null disables.
+  patience: 20          # checkpoint on validation UAUC, not AUC
   grad_clip: 1.0
   # Keep trainable params in fp32 while the frozen Vicuna stays fp16. Required with
   # amp: True -- peft >= 0.5 creates LoRA adapters in the base fp16 dtype, and

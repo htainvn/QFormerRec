@@ -508,6 +508,29 @@ The peak lands at epoch 3 for a reason, and it was two compounding faults, both 
    mapping module; for LoRA on a 7B it is roughly 10x too high. Stage 1 now ships
    `init_lr: 1e-4`, `min_lr: 1e-5`, `warmup_lr: 1e-6`.
 
+### Early stopping
+
+Yes, there is one, inherited from CoLLM: it stops when the selection metric has not improved
+for **20 validations**. Two things to know about the units and the reporting:
+
+* **Patience is counted in validations, not steps or samples** — so it is
+  `patience x iters_per_epoch` optimizer steps. At the shipped stage-1 setting
+  (`iters_per_epoch: 100`) that is 2 000 steps, or ~32 k samples at batch 16, spent after
+  the last improvement before the run gives up.
+* CoLLM hard-codes the 20 and never reports progress toward it, so a run that peaked at
+  epoch 3 looks identical to one still improving. It is now `run.patience`
+  (`0`/`null` disables), and every validation logs the gap:
+
+```
+[valid] epoch 0 uauc=0.480055 | best=0.480055 @ epoch 0 | no improvement for 0/20 validations  <-- new best
+[valid] epoch 1 uauc=0.475677 | best=0.480055 @ epoch 0 | no improvement for 1/20 validations
+Early stop: uauc has not improved for 1 validations (best=0.480055 @ epoch 0). checkpoint_best.pth holds that epoch.
+```
+
+For the collapsing run above, patience 20 means it would have kept going to ~epoch 24. If
+you are sweeping and want to fail fast, `--options run.patience=5`; for a final run, leave
+it at 20 or disable it and rely on `max_epoch`.
+
 Your peak checkpoint is not lost: selection is on validation UAUC, so
 `checkpoint_best.pth` holds the best epoch (0.6348 in the run above), not the last one.
 Confirm with `valid_best_epoch` in the trend print. A collapsed tail wastes time but not the
@@ -540,6 +563,57 @@ shutil.copy(best, '/content/ckpt/stage1_lora_ml1m.pth')
 Trains: Q-Former, candidate-aware query generator, LLM projector, genre/cluster
 prototypes, CoLLM's `<UserID>`/`<TargetItemID>` MLP. Frozen: Vicuna, LoRA, and (with
 `freeze_rec: True`) MF.
+
+### Stage 2 will usually score *below* stage 1's best. That is the design.
+
+This surprises people, so be explicit about what changes between the stages:
+
+| | stage 1 | stage 2 |
+|---|---|---|
+| prompt | TALLRec, **with** `<ItemTitleList>` | short, **no titles**, + 6 soft tokens |
+| LoRA | trainable | **frozen** (loaded from stage 1) |
+| `llama_proj` (`<UserID>`/`<TargetItemID>`) | frozen, never trained, **not in the checkpoint** | randomly initialised, starts training now |
+| Q-Former | does not exist | randomly initialised |
+
+So at stage-2 step 0 the model has: a LoRA tuned for a prompt format it no longer sees, the
+history titles it relied on removed, and six soft tokens pointing in random directions
+(RMS-matched in norm, meaningless in direction). It has to rebuild that signal through the
+Q-Former alone, because LoRA is frozen. A dip is expected.
+
+**This is exactly why stage 3 exists.** It unfreezes LoRA at lr/10 so the adapter can adapt
+to the short prompt, and the spec is emphatic: it "mirrors CoLLM's T1/T2, which is where its
+best numbers came from — do not skip it." Do not conclude anything from stage 2 alone.
+
+**Comparing stage 2 against stage 1's best is the wrong comparison.** Stage 1 had the title
+list; stage 2 does not. The honest floor for stage 2 is *stage 1's checkpoint evaluated on
+the short prompt* — i.e. what the frozen LoRA achieves with no titles and untrained soft
+tokens. That is the number the Q-Former has to beat:
+
+```python
+import glob
+best1 = sorted(glob.glob('/content/logs/stage1_ml1m/*/checkpoint_best.pth'))[-1]
+!python train_qformer.py --cfg-path train_configs/stage2_qformer_ml1m.yaml \
+    --options run.evaluate=True model.ckpt_lora=$best1 \
+              "run.test_splits=[valid]" run.output_dir=/content/logs/floor_stage2
+```
+
+That builds the stage-2 architecture with the stage-1 LoRA and an *untrained* Q-Former, and
+evaluates it. If your trained stage 2 beats that, the Q-Former is contributing even when it
+sits below stage 1's titled number.
+
+**What would be a genuine problem**, and how to tell:
+
+| Check | Healthy | If not |
+|---|---|---|
+| stage-2 UAUC across its own epochs | rising | flat/falling → tuning, see §5.3 |
+| `pref_token_norm` vs `llm_emb_norm` | within 2x | the soft tokens are being ignored, so stage 2 ≈ "stage 1 minus titles" |
+| `token_cosine_offdiag` | < 0.4 | the L tokens collapsed to one |
+| `loss_bce` | decreasing | nothing is learning |
+
+The stage-1 → stage-2 LoRA handoff itself is verified by the integration test (a silent
+failure there would look identical to this symptom, so it is worth having covered): the
+stage-2 model's LoRA tensors are checked equal to the stage-1 checkpoint's, against a
+fresh-init control.
 
 **Keep `freeze_rec: True` for the whole search.** CoLLM notes that tuning the
 collaborative model needs ≥5× the training effort on ML-1M. Unfreeze only for the final
@@ -884,6 +958,8 @@ overhead is what makes Drive-backed runs slow.
 | `OSError: Incorrect path_or_model_id: '.../vicuna-7b-v0'` | the config's Vicuna path is a placeholder, and no merged `vicuna-7b-v0` exists on the Hub | see §5.0: apply the delta, use a merged mirror, or switch to v1.5 and re-run the baselines |
 | `ValueError: Attempting to unscale FP16 gradients` | Vicuna loads in fp16 and peft ≥0.5 casts LoRA adapters to the base dtype, so the only trainable tensors in stage 1/3 are fp16 — `GradScaler` rejects those in `step()` as well as `unscale_()` | keep `run.fp32_trainable: True` (the default): the runner casts trainable params to fp32 and leaves the backbone fp16. CoLLM avoided this only by pinning peft 0.4.0, which created fp32 adapters |
 | `loss=nan`, all params finite, log mentions `LOAD REPORT` or `v4.50` | transformers 5.x corrupting the vendored LLaMA's rotary buffers | `pip install "transformers==4.36.2" "peft==0.9.0"` **and restart the runtime**. `LOAD REPORT` appears only in 5.x, so it is a reliable tell |
+| run keeps going long after it peaked | patience is 20 *validations* = `20 x iters_per_epoch` steps | `--options run.patience=5` while sweeping; the log now shows `no improvement for N/20` |
+| stage 2 scores below stage 1's best | expected: stage 2 drops the history titles, freezes LoRA, and starts with random soft tokens | compare against stage 1 evaluated *on the short prompt* (§5.2), and run stage 3 before judging |
 | stage-1 AUC ~0.50 at the first validation | expected — that is after `iters_per_epoch x batch` = ~1 600 samples, and LoRA's `lora_B` starts at zero so the adapter contributes nothing yet | judge the trend and `best_epoch`, not epoch 0 |
 | stage-1 AUC never leaves ~0.50 and the loss is flat | too little training, or `init_lr` too high for LoRA | you halved the batch without raising `max_epoch` (see §5.1); then try `init_lr: 3e-4` |
 | `prompt_tokens=nan` in a stage-1 `[valid]` line | the legacy arch does not report prompt length | expected; stage 2/3 report it |

@@ -404,6 +404,49 @@ def main():
                   if not n.startswith(("llama_model.", "llama_model_lora."))}
             torch.save({"model": sd}, os.path.join(args.work_dir, "stage2_ckpt.pth"))
 
+    # ------------------------------------------- stage-1 -> stage-2 LoRA handoff
+    # A silent failure here would look exactly like "stage 2 is worse than stage 1":
+    # the LoRA would be at init while the prompt had already changed.
+    print("\n=== stage 1 -> stage 2: does ckpt_lora actually land? ===")
+    from omegaconf import OmegaConf as _OC
+    c1b = _OC.create(_OC.to_container(build_cfg(args, llama_path, 2)))
+    c1b.model.arch = "mini_gpt4rec_v2"
+    c1b.model.prompt_path = os.path.join(ROOT, "prompts/tallrec_movie.txt")
+    c1b.model.freeze_rec, c1b.model.freeze_proj, c1b.model.freeze_lora = True, True, False
+    for k in ["qformer", "loss", "n_titles_kept", "diag_log_freq"]:
+        c1b.model.pop(k, None)
+    mm1 = registry.get_model_class("mini_gpt4rec_v2").from_config(c1b.model)
+    with torch.no_grad():                       # pretend stage 1 trained
+        for n, prm in mm1.named_parameters():
+            if prm.requires_grad:
+                prm.add_(torch.randn_like(prm) * 0.05)
+    grad_dic = {k: v.requires_grad for k, v in mm1.named_parameters()}
+    sd1 = mm1.state_dict()
+    for k in list(sd1):                         # exactly the runner's filter
+        if k in grad_dic and not grad_dic[k]:
+            del sd1[k]
+    ck1 = os.path.join(args.work_dir, "stage1_lora_probe.pth")
+    torch.save({"model": sd1}, ck1)
+    lora_keys = [k for k in sd1 if "lora_" in k]
+    check("stage-1 checkpoint carries the LoRA tensors", len(lora_keys) > 0,
+          f"{len(lora_keys)} lora keys of {len(sd1)} saved")
+    del mm1
+
+    c2b = _OC.create(_OC.to_container(build_cfg(args, llama_path, 2)))
+    c2b.model.ckpt_lora = ck1
+    loaded = mmod.MiniGPT4RecQFormer.from_config(c2b.model)
+    freshm = mmod.MiniGPT4RecQFormer.from_config(build_cfg(args, llama_path, 2).model)
+    gl, gfr = dict(loaded.named_parameters()), dict(freshm.named_parameters())
+    common = [k for k in lora_keys if k in gl]
+    # LoRA is fp16 under peft>=0.5, so compare at fp16 resolution, not 1e-6
+    d_load = max(float((gl[k].detach().float() - sd1[k].float()).abs().max()) for k in common)
+    d_fresh = max(float((gfr[k].detach().float() - sd1[k].float()).abs().max()) for k in common)
+    check("stage-2 LoRA equals the stage-1 checkpoint (fp16 tolerance)",
+          d_load < 1e-3, f"max|loaded-ckpt|={d_load:.2e}")
+    check("control: a fresh init does NOT match (test is not vacuous)",
+          d_fresh > 1e-2, f"max|fresh-ckpt|={d_fresh:.2e}")
+    del loaded, freshm
+
     # ------------------------------------------------------------ lr schedule
     # The inherited warmup gated on the global step but ramped on the per-epoch
     # step, so with warmup_steps > iters_per_epoch it sawtoothed and then jumped
@@ -435,7 +478,6 @@ def main():
     # here covers it -- so a break in that path would only show up as a stage-1
     # run that never learns.
     print("\n=== stage 1: legacy mini_gpt4rec_v2 + TALLRec prompt ===")
-    from omegaconf import OmegaConf as _OC
     c1 = _OC.create(_OC.to_container(build_cfg(args, llama_path, 2)))
     c1.model.arch = "mini_gpt4rec_v2"
     c1.model.prompt_path = os.path.join(ROOT, "prompts/tallrec_movie.txt")

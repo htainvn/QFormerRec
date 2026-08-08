@@ -1,6 +1,6 @@
 """Runner for the Q-Former runs.
 
-Adds three things CoLLM's ``RecRunnerBase`` cannot express:
+Adds four things CoLLM's ``RecRunnerBase`` cannot express:
 
 1. **Per-group learning rates.** CoLLM's schedulers overwrite ``lr`` on *every*
    param group, so per-group ``lr`` set on the optimiser is silently destroyed.
@@ -9,15 +9,21 @@ Adds three things CoLLM's ``RecRunnerBase`` cannot express:
    stage-2/3 table (Q-Former 1x, prototypes 1x, MF 0.1x, LoRA 0.1x).
 2. **The user-grouped batch sampler**, needed by ``L_rank``.
 3. **Q-Former diagnostics** written once per epoch to the output dir.
+4. **A configurable, reported early stop.** CoLLM hard-codes patience at 20
+   validations and never says how close it is; ``run.patience`` sets it and every
+   validation logs the gap to the stop.
 """
 
+import datetime
 import logging
 import math
 import os
+import time
 
 import torch
+import torch.distributed as dist
 import webdataset as wds
-from minigpt4.common.dist_utils import get_rank, get_world_size
+from minigpt4.common.dist_utils import get_rank, get_world_size, is_main_process
 from minigpt4.common.registry import registry
 from minigpt4.datasets.data_utils import ChainDataset
 from minigpt4.datasets.datasets.dataloader_utils import IterLoader, MultiIterLoader, PrefetchLoader
@@ -98,6 +104,89 @@ class LinearWarmupCosineLRSchedulerScaled:
 
 @registry.register_runner("rec_runner_qformer")
 class RecRunnerQFormer(RecRunnerBase):
+    def train(self):
+        """CoLLM's training loop with a configurable, visible early stop.
+
+        The inherited loop hard-codes ``if not_change > 20: break`` -- patience of
+        20 *validations*, i.e. ``20 x iters_per_epoch`` steps, which is 2 000 steps
+        at the shipped stage-1 setting. It is neither configurable nor reported, so
+        a run that peaks early spends 20 more validations going nowhere before it
+        stops, and nothing in the log says why it is still going.
+
+        Same logic here, with ``run.patience`` (default 20, ``0``/``null`` disables)
+        and a line after every validation saying how close the stop is.
+        """
+        start_time = time.time()
+        best_agg_metric, best_epoch, not_change = -100000, 0, 0
+        patience = self.config.run_cfg.get("patience", 20)
+        patience = int(patience) if patience else 0
+        self.set_model_mode(self.config.run_cfg.mode)
+        self.log_config()
+        metric = getattr(self.task, "select_metric", "agg_metrics")
+        logging.info("early stopping: patience=%s validations (%s steps each), on %s",
+                     patience or "disabled", self.config.run_cfg.get("iters_per_epoch"),
+                     metric)
+
+        if self.resume_ckpt_path is not None and not self.evaluate_only:
+            self._load_checkpoint(self.resume_ckpt_path)
+
+        cur_epoch = self.start_epoch
+        if not self.evaluate_only:
+            for cur_epoch in range(self.start_epoch, self.max_epoch):
+                if self.model_to_betrained():
+                    logging.info("Start training")
+                    self.log_stats(split_name="train", stats=self.train_epoch(cur_epoch))
+
+                if len(self.valid_splits) > 0:
+                    for split_name in self.valid_splits:
+                        logging.info("Evaluating on {}.".format(split_name))
+                        val_log = self.eval_epoch(split_name=split_name, cur_epoch=cur_epoch)
+                        if val_log is None or not is_main_process():
+                            continue
+                        assert "agg_metrics" in val_log, "No agg_metrics found in validation log."
+                        agg_metrics = val_log["agg_metrics"]
+                        improved = agg_metrics > best_agg_metric and split_name == "valid"
+                        if improved:
+                            best_epoch, best_agg_metric = cur_epoch, agg_metrics
+                            self._save_checkpoint(cur_epoch, is_best=True)
+                            not_change = 0
+                        val_log.update({"best_epoch": best_epoch})
+                        self.log_stats(val_log, split_name)
+                        if split_name == "valid":
+                            not_change += 1
+                            logging.info(
+                                "[%s] epoch %s %s=%.6f | best=%.6f @ epoch %s | "
+                                "no improvement for %s/%s validations%s",
+                                split_name, cur_epoch, metric, agg_metrics,
+                                best_agg_metric, best_epoch, max(not_change - 1, 0),
+                                patience or "inf",
+                                "  <-- new best" if improved else "",
+                            )
+                else:
+                    self._save_checkpoint(cur_epoch, is_best=False)
+
+                if self.config.run_cfg.distributed:
+                    dist.barrier()
+                if not self.model_to_betrained():
+                    break
+                if patience and not_change > patience:
+                    logging.info(
+                        "Early stop: %s has not improved for %s validations "
+                        "(best=%.6f @ epoch %s). checkpoint_best.pth holds that epoch.",
+                        metric, patience, best_agg_metric, best_epoch,
+                    )
+                    break
+
+        if self.evaluate_only:
+            print("training finish or just evaluation...")
+            logging.info("Evaluating on {}.".format(self.test_splits[0]))
+            test_epoch = "best" if len(self.valid_splits) > 0 else cur_epoch
+            self.evaluate(cur_epoch=test_epoch, skip_reload=self.evaluate_only)
+
+        logging.info("Training time %s",
+                     str(datetime.timedelta(seconds=int(time.time() - start_time))))
+        self.set_model_mode(None)
+
     def setup_output_dir(self):
         """As the base, plus a real log file next to the checkpoint.
 

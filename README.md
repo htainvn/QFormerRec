@@ -130,13 +130,17 @@ Found while building this; all are load-bearing.
 3. **The ML-1M warm/cold split cannot run.** Its builder points at a
    `test_warm_cold_ood2.pkl` that is absent from the released data and filters on a `warm`
    column that is also absent. Derived from `not_cold` here (4153 warm + 3178 cold = 7331).
-4. **Per-group learning rates are silently destroyed** — CoLLM's LR schedulers assign
+4. **Early stopping is hard-coded and silent** — patience 20 *validations*
+   (`20 x iters_per_epoch` steps) with no report of how close the stop is, so a run that
+   peaked early is indistinguishable from one still improving. Now `run.patience`, with the
+   gap logged after every validation.
+5. **Per-group learning rates are silently destroyed** — CoLLM's LR schedulers assign
    `lr` to every param group. Hence `lr_scale` + `linear_warmup_cosine_lr_scaled`.
-5. **No gradient clipping** in the training loop; added at 1.0, with `scaler.unscale_`
+6. **No gradient clipping** in the training loop; added at 1.0, with `scaler.unscale_`
    first so it is correct under fp16 AMP.
-6. `RunnerBase.model` returns `None` when the model already sits on the target device, and
+7. `RunnerBase.model` returns `None` when the model already sits on the target device, and
    `PrefetchLoader` hard-requires CUDA — both blocked CPU debugging.
-7. **CoLLM's `requirements.txt` cannot be installed on a current Python.** Colab is on
+8. **CoLLM's `requirements.txt` cannot be installed on a current Python.** Colab is on
    3.12; `transformers==4.28.0` requires `tokenizers<0.14`, which has no cp312 wheel, so
    pip attempts a Rust source build and fails. `scikit-learn==1.2.2` compiles from source,
    and `decord` has no wheel for ≥3.11 at all. This project pins `transformers==4.36.2` +
@@ -145,7 +149,7 @@ Found while building this; all are load-bearing.
    and stubs `decord` in [`qformerrec/compat.py`](qformerrec/compat.py).
    `check_environment()` names each of these failure modes instead of letting them surface
    as ImportErrors inside CoLLM.
-8. **transformers 5.x silently NaNs CoLLM's vendored LLaMA.** Its loader reports
+9. **transformers 5.x silently NaNs CoLLM's vendored LLaMA.** Its loader reports
    `self_attn.rotary_emb.inv_freq | MISSING` and leaves the vendored
    `LlamaRotaryEmbedding`'s `cos_cached` / `sin_cached` *buffers* as uninitialised memory;
    4.x re-runs the module init instead. Every **parameter** stays finite, so the only
@@ -155,7 +159,7 @@ Found while building this; all are load-bearing.
    loaded by the *vendored* one) and by inspecting buffers, since neither a version test nor
    a parameter scan catches it — and the entry points refuse to start.
 
-9. **peft ≥ 0.5 makes LoRA fp16, which `GradScaler` cannot train.** Vicuna is loaded
+10. **peft ≥ 0.5 makes LoRA fp16, which `GradScaler` cannot train.** Vicuna is loaded
    `torch_dtype=float16`, and modern peft casts new adapters to the base layer's dtype, so
    in stages 1 and 3 every trainable tensor is fp16 — and `GradScaler` rejects fp16
    gradients in `step()` just as much as in `unscale_()`, so `amp: True` cannot start.
@@ -163,7 +167,7 @@ Found while building this; all are load-bearing.
    casts trainable params back to fp32 (`run.fp32_trainable`, default on), which restores
    the precision CoLLM trained with and is the standard mixed-precision LoRA arrangement.
 
-10. **CoLLM's warmup does not warm up when `warmup_steps > iters_per_epoch`.** It gates on
+11. **CoLLM's warmup does not warm up when `warmup_steps > iters_per_epoch`.** It gates on
    the global step but ramps on the within-epoch step, so the lr sawtooths for the warmup
    period and then jumps to the full `init_lr` in one step — the shipped stage-1 setting
    (300 vs 100) hits this. The visible symptom is a run that improves for exactly
