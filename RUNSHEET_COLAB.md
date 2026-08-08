@@ -705,13 +705,62 @@ before touching anything else. If it destabilises again, the next suspect is `ll
 11.2M freshly-initialised parameters writing straight into embedding space against ~800k for
 the Q-Former core, so it has its own lr group — try `--options run.lr_scale.proj=0.3`.
 
-To rule out overfitting rather than assuming, compare the *train* loss against the
-validation loss (both rising = diverging; train falling while valid rises = overfitting):
+**After fixing the lr, the remaining failure looks different — and needs the opposite fix.**
+A second observed run, at `3e-4`:
+
+| epoch | val loss | AUC | UAUC | `token_cos` |
+|---|---|---|---|---|
+| 0 | 0.734 | 0.6292 | **0.6303** ← best | 0.161 |
+| 4 | 1.333 | 0.5900 | 0.6162 | 0.059 |
+| 8 | 1.809 | 0.6099 | 0.6138 | −0.029 |
+| 13 | 1.853 | 0.6031 | 0.6009 | −0.014 |
+
+`token_cos` now sits at ~0.00 for the whole run — the collapse is gone and the anti-collapse
+terms are doing their job. But **validation loss grows 2.5x while AUC stays flat** (0.57–0.63).
+That combination is diagnostic: AUC and UAUC are *rank* metrics and therefore scale
+invariant, whereas `L_bce` is computed on an unbounded LM logit. A loss that explodes while
+the ranking holds means the logit magnitudes are growing — confident wrong answers — i.e.
+**overfitting, not divergence.** Lowering the lr further will not fix this.
+
+Note also *where* the peak is: epoch 0, after `iters_per_epoch x batch` = 9 600 samples,
+0.28 of one real pass. The useful signal is learned almost immediately and everything after
+is memorisation, which is the spec's own failure mode 4 ("839 users, 33k train rows -> it
+overfits fast").
+
+Two responses, in order:
+
+1. **Validate more often so the peak can actually be checkpointed.** `iters_per_epoch: 200`
+   cannot see inside the epoch where the best model lives. Stage 2 now ships `50` (ML-1M) /
+   `100` (Amazon) with `max_epoch` raised to keep the same step budget. Combined with
+   `patience`, this run is *cheaper* than the coarse one, because it stops as soon as it
+   plateaus instead of grinding through 40 epochs of memorisation.
+2. **Then regularise**, following the spec: `dropout: 0.2` (from 0.1), `weight_decay: 1e-2`
+   (from 1e-3), and `k_neighbor: 4` (from 8):
 
 ```python
-!grep "train epoch" /content/logs/stage2_ml1m/*/train.log | tail -5
-!grep "Averaged stats" /content/logs/stage2_ml1m/*/train.log | tail -5
+!python train_qformer.py --cfg-path train_configs/stage2_qformer_ml1m.yaml \
+    --options model.qformer.dropout=0.2 run.weight_decay=1e-2 \
+              model.qformer.memory.k_neighbor=4 \
+              run.output_dir=/content/logs/stage2_reg
 ```
+
+Because val loss is an unreliable signal here, **do not** early-stop on it — selection is on
+UAUC, which is correct precisely because it ignores logit scale.
+
+### valid is not test — do not compare against the target yet
+
+The acceptance numbers in §6.2 are **test** UAUC. From CoLLM's own logged MF run on ML-1M
+(in `baseline_train_mf_ood.py`), the two splits do not agree, and not even in the same
+direction per metric:
+
+| | valid | test | delta |
+|---|---|---|---|
+| AUC | 0.6760 | 0.6482 | **−0.0278** |
+| UAUC | 0.6192 | 0.6361 | **+0.0169** |
+
+So a valid UAUC of 0.6303 corresponds to roughly **0.647 test** UAUC, against the 0.6956
+target — a real gap, but smaller than reading the valid number against a test target
+suggests. Only the final eval-only run on `test` is comparable to the published table.
 
 | Watch | Healthy | If not |
 |---|---|---|

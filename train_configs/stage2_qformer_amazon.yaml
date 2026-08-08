@@ -121,8 +121,11 @@ run:
   strict_batch: True
 
   weight_decay: 1e-3
-  max_epoch: 30               # 30 x 400 iters x 48 rows ~ 3 real epochs
-  iters_per_epoch: 400
+  max_epoch: 120               # 30 x 400 iters x 48 rows ~ 3 real epochs
+  # Validation cadence. The metric peaks INSIDE the first 200 steps on ML-1M,
+  # so 200+ is too coarse to checkpoint the peak. Finer + early stopping is
+  # cheaper overall, because the run ends as soon as it plateaus.
+  iters_per_epoch: 100
   batch_size_train: 48        # ignored while user_grouped_sampler is on
   batch_size_eval: 64
   num_workers: 4
