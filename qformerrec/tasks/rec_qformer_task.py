@@ -97,6 +97,19 @@ class RecQFormerTask(RecBaseTask):
 
             if (i + 1) % accum_grad_iters == 0:
                 if use_amp:
+                    # GradScaler rejects fp16 grads in both unscale_() and step(),
+                    # so surface the cause instead of torch's bare ValueError.
+                    fp16 = [p for p in params
+                            if p.grad is not None and p.grad.dtype == torch.float16]
+                    if fp16:
+                        raise RuntimeError(
+                            f"{len(fp16)} trainable tensors have fp16 gradients, which "
+                            "torch.cuda.amp.GradScaler cannot unscale (it raises "
+                            "'Attempting to unscale FP16 gradients'). Cause: Vicuna is "
+                            "loaded in fp16 and peft>=0.5 casts LoRA adapters to the base "
+                            "dtype. Fix: leave run.fp32_trainable at its default True so "
+                            "the runner casts trainable params to fp32, or set amp: False."
+                        )
                     if grad_clip and grad_clip > 0:
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(params, grad_clip)

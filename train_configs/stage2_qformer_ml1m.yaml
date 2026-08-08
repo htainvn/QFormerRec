@@ -96,6 +96,11 @@ run:
   mode: 'v2'
   select_metric: uauc
   grad_clip: 1.0
+  # Keep trainable params in fp32 while the frozen Vicuna stays fp16. Required with
+  # amp: True -- peft >= 0.5 creates LoRA adapters in the base fp16 dtype, and
+  # GradScaler refuses fp16 gradients. CoLLM's peft 0.4.0 pin gave fp32 adapters,
+  # so this restores the precision it actually trained with.
+  fp32_trainable: True
 
   lr_scale:                   # effective lr = init_lr * scale
     qformer: 1.0              # 1e-3

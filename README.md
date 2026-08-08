@@ -77,8 +77,10 @@ scripts/
   pretrain_mf.py                   stage 0 (parameterised port of CoLLM's MF baseline)
   build_memory.py                  stage 0b: the train-only fitted objects + item_in_train
   check_pit_history.py             proves the per-row history is point-in-time, not leakage
-  smoke_test.py                    50 CPU checks, no LLM needed
-  integration_test.py              end to end on a tiny random LLaMA, incl. 18 ablations
+  s3_sync.sh                       push/pull checkpoints to S3-compatible storage
+  doctor.py                        one-command setup diagnostic
+  smoke_test.py                    75 CPU checks, no LLM needed
+  integration_test.py              end to end on a tiny random LLaMA, incl. 21 ablations
 train_configs/                     stage1/2/3 × {ml1m, amazon}
 prompts/                           short / terse / +titles / tallrec, per dataset
 train_qformer.py                   entry point for all stages
@@ -152,6 +154,14 @@ Found while building this; all are load-bearing.
    under a second — via the realistic path (a checkpoint written by *transformers'* class,
    loaded by the *vendored* one) and by inspecting buffers, since neither a version test nor
    a parameter scan catches it — and the entry points refuse to start.
+
+9. **peft ≥ 0.5 makes LoRA fp16, which `GradScaler` cannot train.** Vicuna is loaded
+   `torch_dtype=float16`, and modern peft casts new adapters to the base layer's dtype, so
+   in stages 1 and 3 every trainable tensor is fp16 — and `GradScaler` rejects fp16
+   gradients in `step()` just as much as in `unscale_()`, so `amp: True` cannot start.
+   CoLLM only escaped this by pinning peft 0.4.0, which left adapters in fp32. The runner
+   casts trainable params back to fp32 (`run.fp32_trainable`, default on), which restores
+   the precision CoLLM trained with and is the standard mixed-precision LoRA arrangement.
 
 And one bug of our own worth recording: `L_attn`'s Bhattacharyya coefficient needs an
 `eps` inside the `sqrt`. Masked memory slots get exactly zero attention and

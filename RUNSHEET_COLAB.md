@@ -40,6 +40,10 @@ import torch; print(torch.__version__, torch.cuda.get_device_name(0),
 Colab's runtime is **Python 3.12**. CoLLM's own `requirements.txt` is from the 3.9/3.10
 era and **cannot be installed there** — do not use it:
 
+* `peft==0.4.0` created LoRA adapters in fp32; **peft ≥ 0.5 casts them to the base fp16
+  dtype**, which `GradScaler` cannot unscale. We pin 0.9.0 (0.4.0 predates the
+  `prepare_model_for_int8_training` removal but is otherwise ageing) and cast trainable
+  params back to fp32 in the runner — see `run.fp32_trainable`.
 * `transformers==4.28.0` requires `tokenizers<0.14`, and tokenizers has **no cp312 wheel
   below 0.14**. pip falls back to building it from Rust source and dies with
   `Failed building wheel for tokenizers`.
@@ -487,6 +491,7 @@ train history item is a train item) and nonzero on valid/test.
 | `hist_slots_filled` | ≫ 0 | 0 → `PitHistItems` is not reaching the model |
 | `hist_unk_rate` | ~1 % (ML-1M), ~10 % (Amazon) | much higher → wrong `item_in_train`, i.e. a stale memory index |
 | `loss_bce` | a real number | `nan` → almost certainly transformers 5.x (§1.2) |
+| `[runner] cast N trainable tensors ... to fp32` | expected in stages 1 and 3 | absent in stage 2 is normal — the Q-Former is built in fp32 already |
 | `history_source` | `pit` | `train_only` means you are running the ablation by accident |
 | `valid_uauc` in `log.txt` | a real number | **NaN → see below** |
 
@@ -637,16 +642,114 @@ Stage 2 as shipped = 40 × 200 × 48 ≈ 11 real epochs over the 33 891 train ro
 
 ## 7. Surviving a Colab disconnect
 
+Everything worth keeping is small — a few hundred MB per run — so push it off the runtime
+as soon as each stage finishes. Two options; use either or both.
+
+### 7.1 Checkpoints to S3-compatible storage
+
+What each stage produces, and which command it needs:
+
+| Stage | Path | Kind | Size (real Vicuna) |
+|---|---|---|---|
+| 0 — MF | `/content/ckpt/mf_{ml1m,amazon}_d256.pth` | loose **file** | 4 MB / 58 MB |
+| 0b — memory index | `/content/ckpt/memory_index_*.pkl` | loose **file** | < 1 MB / few MB |
+| 1 — LoRA | `/content/logs/stage1_*/<job_id>/` | **dir** | ~50 MB (LoRA + optim state) |
+| 2 — Q-Former | `/content/logs/stage2_*/<job_id>/` | **dir** | ~170 MB |
+| 3 — joint | `/content/logs/stage3_*/<job_id>/` | **dir** | ~220 MB |
+| eval | `/content/logs/eval_*/<job_id>/` | **dir** | < 1 MB (metrics only) |
+
+Each run dir holds `checkpoint_best.pth`, `log.txt` (per-validation metrics) and
+`qformer_diagnostics.jsonl` — you want all three, not just the weights: the last two are
+deliverables 3–6.
+
+```python
+import os
+os.environ["ENDPOINT_URL"] = "https://<your-endpoint>"     # same var as your other projects
+RUN = "ml1m-pit-k50"        # tag this run; mirrors the `sella-aug` slot in your commands
+os.environ["RUN"] = RUN
+BUCKET = "s3://qformerrec"
+os.environ["BUCKET"] = BUCKET
+```
+
+```python
+# --- stage 0 + 0b. These are FILES, so `cp`, not `sync` (`s3 sync` requires a
+# --- directory source and errors on a file).
+!aws --endpoint-url="$ENDPOINT_URL" s3 cp /content/ckpt/mf_ml1m_d256.pth       $BUCKET/mf/$RUN/
+!aws --endpoint-url="$ENDPOINT_URL" s3 cp /content/ckpt/memory_index_ml1m.pkl  $BUCKET/memory_index/$RUN/
+
+# --- or push the whole ckpt dir in one shot, which is simpler and idempotent
+!aws --endpoint-url="$ENDPOINT_URL" s3 sync /content/ckpt $BUCKET/ckpt/$RUN/ --exclude "*.tmp"
+```
+
+```python
+# --- stages 1-3 and eval. These ARE directories, so `sync` works as in your other
+# --- projects. Syncing the parent picks up the <job_id> subdir automatically.
+!aws --endpoint-url="$ENDPOINT_URL" s3 sync /content/logs/stage1_ml1m $BUCKET/qformer_stage1/$RUN/
+!aws --endpoint-url="$ENDPOINT_URL" s3 sync /content/logs/stage2_ml1m $BUCKET/qformer_stage2/$RUN/
+!aws --endpoint-url="$ENDPOINT_URL" s3 sync /content/logs/stage3_ml1m $BUCKET/qformer_stage3/$RUN/
+!aws --endpoint-url="$ENDPOINT_URL" s3 sync /content/logs/eval_ml1m   $BUCKET/qformer_eval/$RUN/
+```
+
+Or everything in one call, which is what I would actually run after each stage:
+
+```python
+!aws --endpoint-url="$ENDPOINT_URL" s3 sync /content/ckpt $BUCKET/ckpt/$RUN/
+!aws --endpoint-url="$ENDPOINT_URL" s3 sync /content/logs $BUCKET/logs/$RUN/ \
+    --exclude "*/result/*"
+```
+
+### 7.2 Restoring after a restart
+
+This is the direction that actually saves you time — Colab keeps nothing under `/content`.
+
+```python
+!mkdir -p /content/ckpt /content/logs
+!aws --endpoint-url="$ENDPOINT_URL" s3 sync $BUCKET/ckpt/$RUN/ /content/ckpt
+!aws --endpoint-url="$ENDPOINT_URL" s3 sync $BUCKET/logs/$RUN/ /content/logs
+!ls -la /content/ckpt && find /content/logs -name "checkpoint_best.pth"
+```
+
+Then re-point the configs, since the `<job_id>` will differ from the one in the yaml:
+
+```python
+import glob
+best1 = sorted(glob.glob('/content/logs/stage1_ml1m/*/checkpoint_best.pth'))[-1]
+best2 = sorted(glob.glob('/content/logs/stage2_ml1m/*/checkpoint_best.pth'))[-1]
+!sed -i "s#ckpt_lora: .*#ckpt_lora: $best1#" train_configs/stage[23]_qformer_ml1m.yaml
+!sed -i "s#^  ckpt: .*#  ckpt: $best2#"      train_configs/stage3_qformer_ml1m.yaml
+!grep -E "^  ckpt" train_configs/stage3_qformer_ml1m.yaml
+```
+
+To resume an *interrupted* stage rather than start the next one, set `resume_ckpt_path` to
+the restored checkpoint — it restores model + optimizer + epoch, which is why the optimizer
+state is worth the extra MB:
+
+```yaml
+run:
+  resume_ckpt_path: /content/logs/stage2_ml1m/<restored_job_id>/checkpoint_best.pth
+```
+
+Practical notes:
+
+* **Never sync the Vicuna weights** (13.5 GB, and re-downloadable from the Hub in minutes).
+  If you sync `/content` wholesale, exclude them.
+* Add `--dryrun` first when you are unsure what a command will move.
+* Prefer syncing **between** stages, not mid-training: `checkpoint_best.pth` is rewritten in
+  place whenever validation UAUC improves, so a mid-write copy can be truncated.
+* `sync` compares size and mtime, so re-running it is cheap and idempotent.
+* If `aws` is missing from the runtime: `!pip -q install awscli`.
+
+### 7.3 Or just use Drive
+
 ```yaml
 run:
   output_dir: /content/drive/MyDrive/collm_logs/stage2_ml1m   # absolute path is honoured
   resume_ckpt_path: /content/drive/MyDrive/collm_logs/stage2_ml1m/<job_id>/checkpoint_best.pth
 ```
 
-`resume_ckpt_path` restores model + optimizer + epoch. Note each launch creates a new
-`<job_id>` subdirectory, so pass the *old* job's path when resuming.
-
----
+Writing checkpoints straight to Drive is fine (they are small and written rarely). Do not
+put the *dataset* or the *Vicuna weights* on Drive — those are read constantly, and the FUSE
+overhead is what makes Drive-backed runs slow.
 
 ## 8. Failure modes, in the order you will hit them
 
@@ -654,6 +757,7 @@ run:
 |---|---|---|
 | `huggingface-cli: command not found`, or a deprecation warning | renamed to `hf` in hub 0.34, removed in hub 1.0 | use `snapshot_download(repo_id, local_dir=...)` — stable across 0.x and 1.x — or `hf download` |
 | `OSError: Incorrect path_or_model_id: '.../vicuna-7b-v0'` | the config's Vicuna path is a placeholder, and no merged `vicuna-7b-v0` exists on the Hub | see §5.0: apply the delta, use a merged mirror, or switch to v1.5 and re-run the baselines |
+| `ValueError: Attempting to unscale FP16 gradients` | Vicuna loads in fp16 and peft ≥0.5 casts LoRA adapters to the base dtype, so the only trainable tensors in stage 1/3 are fp16 — `GradScaler` rejects those in `step()` as well as `unscale_()` | keep `run.fp32_trainable: True` (the default): the runner casts trainable params to fp32 and leaves the backbone fp16. CoLLM avoided this only by pinning peft 0.4.0, which created fp32 adapters |
 | `loss=nan`, all params finite, log mentions `LOAD REPORT` or `v4.50` | transformers 5.x corrupting the vendored LLaMA's rotary buffers | `pip install "transformers==4.36.2" "peft==0.9.0"` **and restart the runtime**. `LOAD REPORT` appears only in 5.x, so it is a reliable tell |
 | `RuntimeError: incompatible environment` at startup | the fail-fast check working as intended | read the `[compat] PROBLEM:` lines directly above it |
 | `Failed building wheel for tokenizers` | `transformers==4.28.0` wants `tokenizers<0.14`, which has no cp312 wheel | use the §1 pins (`transformers==4.36.2`); do **not** use CoLLM's `requirements.txt` |

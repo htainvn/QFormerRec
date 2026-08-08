@@ -404,6 +404,51 @@ def main():
                   if not n.startswith(("llama_model.", "llama_model_lora."))}
             torch.save({"model": sd}, os.path.join(args.work_dir, "stage2_ckpt.pth"))
 
+    # ------------------------------------------------- fp16/GradScaler contract
+    # The gap that let `ValueError: Attempting to unscale FP16 gradients` reach a
+    # real run: every test here used amp: False, so the GradScaler path with an
+    # fp16-loaded backbone was never exercised. GradScaler needs CUDA, so assert
+    # the precondition it enforces -- no trainable tensor may have an fp16 grad.
+    print("\n=== fp16 / GradScaler contract ===")
+    cfg_amp = build_cfg(args, llama_path, 2)
+    cfg_amp.run.amp = True
+    m_amp = mmod.MiniGPT4RecQFormer.from_config(cfg_amp.model)   # NOT .float()
+    m_amp.set_mode("v2")
+    pre = {n: p.dtype for n, p in m_amp.named_parameters() if p.requires_grad}
+    check("stage 2 trainable params are fp32 before any cast (fp16 backbone only)",
+          all(d == torch.float32 for d in pre.values()),
+          f"dtypes={sorted({str(d) for d in pre.values()})}")
+
+    # stage 3 unfreezes LoRA, which peft>=0.5 creates in the base fp16 dtype
+    cfg3 = build_cfg(args, llama_path, 3)
+    cfg3.model.ckpt = os.path.join(args.work_dir, "stage2_ckpt.pth")
+    m3 = mmod.MiniGPT4RecQFormer.from_config(cfg3.model)
+    lora_dtypes = {str(p.dtype) for n, p in m3.named_parameters()
+                   if p.requires_grad and "lora_" in n}
+    print(f"        LoRA dtypes as peft created them: {sorted(lora_dtypes) or 'none'}")
+    # the runner's cast is what makes GradScaler viable
+    runner_cls = registry.get_runner_class("rec_runner_qformer")
+    runner_cls._cast_trainable_to_fp32(
+        type("C", (), {"config": type("R", (), {"run_cfg": {"fp32_trainable": True}})()})(),
+        m3,
+    )
+    after = {str(p.dtype) for n, p in m3.named_parameters() if p.requires_grad}
+    check("after the runner cast, every trainable param is fp32",
+          after == {"torch.float32"}, f"dtypes={sorted(after)}")
+    check("frozen backbone stays fp16 (memory unchanged)",
+          any(p.dtype == torch.float16 for n, p in m3.named_parameters()
+              if not p.requires_grad),
+          "at least one frozen fp16 tensor remains")
+    m3 = m3.float()
+    m3.set_mode("v2")
+    out3 = m3.forward_v2(batch)
+    out3["loss"].backward()
+    bad = [n for n, p in m3.named_parameters()
+           if p.requires_grad and p.grad is not None and p.grad.dtype == torch.float16]
+    check("no trainable tensor produces an fp16 gradient (GradScaler precondition)",
+          not bad, f"offenders={bad[:3]}")
+    del m_amp, m3
+
     # ------------------------------------------------------ ablation configs
     print("\n=== every ablation row from the spec builds + trains one step ===")
     from omegaconf import OmegaConf

@@ -92,11 +92,47 @@ class RecRunnerQFormer(RecRunnerBase):
         """
         if self._wrapped_model is None:
             self._model = self._model.to(self.device)
+            self._cast_trainable_to_fp32(self._model)
             if self.use_distributed:
                 self._wrapped_model = DDP(self._model, device_ids=[self.config.run_cfg.gpu])
             else:
                 self._wrapped_model = self._model
         return self._wrapped_model
+
+    def _cast_trainable_to_fp32(self, model):
+        """Keep trainable parameters in fp32 while the frozen backbone stays fp16.
+
+        Vicuna is loaded with ``torch_dtype=float16``, and peft >= 0.5 casts new
+        LoRA adapters to the *base layer's* dtype -- so on a modern peft the only
+        trainable parameters in stage 1/3 come out fp16. ``GradScaler`` refuses
+        those outright (``ValueError: Attempting to unscale FP16 gradients``), from
+        ``scaler.step()`` as much as from an explicit ``scaler.unscale_()``, so with
+        ``amp: True`` training cannot start at all.
+
+        CoLLM never hit this because it pins peft 0.4.0, which left the adapters in
+        fp32. Casting them back is therefore not a deviation -- it restores the
+        precision CoLLM actually trained with, and it is the standard
+        mixed-precision LoRA arrangement (frozen fp16 base, fp32 adapters). peft
+        casts activations to the adapter dtype in its forward, so this is safe.
+
+        Cost is negligible: ~4.2M LoRA params, i.e. ~17 MB extra.
+        """
+        if not bool(self.config.run_cfg.get("fp32_trainable", True)):
+            logging.warning("fp32_trainable=False: leaving trainable params in their "
+                            "loaded dtype. With amp: True this will fail in GradScaler.")
+            return
+        casted, n = [], 0
+        for name, p in model.named_parameters():
+            if p.requires_grad and p.dtype in (torch.float16, torch.bfloat16):
+                p.data = p.data.float()
+                casted.append(name)
+                n += p.numel()
+        if casted:
+            msg = (f"cast {len(casted)} trainable tensors ({n/1e6:.1f}M params) to fp32 "
+                   f"(were fp16/bf16); frozen backbone left untouched. "
+                   f"e.g. {casted[0]}")
+            logging.info(msg)
+            print("[runner]", msg)
 
     # ---------------------------------------------------------------- optim
     @property
