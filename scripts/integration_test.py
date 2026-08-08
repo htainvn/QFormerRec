@@ -404,6 +404,96 @@ def main():
                   if not n.startswith(("llama_model.", "llama_model_lora."))}
             torch.save({"model": sd}, os.path.join(args.work_dir, "stage2_ckpt.pth"))
 
+    # ------------------------------------------------------------ lr schedule
+    # The inherited warmup gated on the global step but ramped on the per-epoch
+    # step, so with warmup_steps > iters_per_epoch it sawtoothed and then jumped
+    # to full lr -- the rise-then-collapse signature. Assert it is monotonic.
+    print("\n=== lr schedule: warmup must ramp monotonically ===")
+    sched_cls = registry.get_lr_scheduler_class("linear_warmup_cosine_lr_scaled")
+    dummy = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=1.0)
+    dummy.param_groups[0]["lr_scale"] = 1.0
+    sch = sched_cls(optimizer=dummy, max_epoch=120, iters_per_epoch=100,
+                    min_lr=1e-5, init_lr=1e-4, warmup_steps=300, warmup_start_lr=1e-6)
+    warm = [sch.lr_at(e, s_) for e in range(3) for s_ in range(100)]
+    check("warmup is monotonically increasing (no per-epoch sawtooth)",
+          all(b >= a for a, b in zip(warm, warm[1:])),
+          f"start={warm[0]:.2e} end={warm[-1]:.2e}")
+    check("warmup ends at init_lr, no jump afterwards",
+          abs(sch.lr_at(3, 0) - 1e-4) / 1e-4 < 0.01
+          and abs(warm[-1] - 1e-4) / 1e-4 < 0.02,
+          f"lr[epoch3,step0]={sch.lr_at(3, 0):.3e} vs init_lr=1.0e-04")
+    check("cosine decays after warmup and respects min_lr",
+          sch.lr_at(60, 0) < sch.lr_at(3, 0) and sch.lr_at(119, 99) >= 1e-5 * 0.99,
+          f"mid={sch.lr_at(60, 0):.2e} end={sch.lr_at(119, 99):.2e}")
+    dummy.param_groups[0]["lr_scale"] = 0.1
+    sch.step(60, 0)
+    check("lr_scale is applied per group",
+          abs(dummy.param_groups[0]["lr"] - 0.1 * sch.lr_at(60, 0)) < 1e-12)
+
+    # ---------------------------------------------------- stage 1 (legacy arch)
+    # Stage 1 runs CoLLM's `mini_gpt4rec_v2`, not our subclass, and nothing else
+    # here covers it -- so a break in that path would only show up as a stage-1
+    # run that never learns.
+    print("\n=== stage 1: legacy mini_gpt4rec_v2 + TALLRec prompt ===")
+    from omegaconf import OmegaConf as _OC
+    c1 = _OC.create(_OC.to_container(build_cfg(args, llama_path, 2)))
+    c1.model.arch = "mini_gpt4rec_v2"
+    c1.model.prompt_path = os.path.join(ROOT, "prompts/tallrec_movie.txt")
+    c1.model.freeze_rec, c1.model.freeze_proj, c1.model.freeze_lora = True, True, False
+    for k in ["qformer", "loss", "n_titles_kept", "diag_log_freq"]:
+        c1.model.pop(k, None)
+    c1.run.user_grouped_sampler = False
+    c1.run.lr_scale = {"lora": 1.0, "qformer": 1.0, "proto": 1.0, "rec": 0.1}
+    c1.run.output_dir = os.path.join(args.work_dir, "out_stage1")
+
+    m1 = registry.get_model_class("mini_gpt4rec_v2").from_config(c1.model).float()
+    m1.set_mode("v2")
+    tr1 = {n for n, p in m1.named_parameters() if p.requires_grad}
+    check("stage 1: only LoRA is trainable",
+          tr1 and all("lora_" in n for n in tr1), f"{len(tr1)} tensors, e.g. {sorted(tr1)[:1]}")
+    check("stage 1: MF and llama_proj frozen",
+          not any(n.startswith(("rec_encoder", "llama_proj")) for n in tr1))
+
+    # the TALLRec prompt must actually receive the history titles
+    prompt1 = m1.prompt_list[0]
+    check("stage 1 prompt is the text-only TALLRec one",
+          "<ItemTitleList>" in prompt1 and "<PrefTokens>" not in prompt1
+          and "<UserID>" not in prompt1, prompt1[:60])
+    enc1, _ = m1.encode_recdata_v2(batch, ids_order=[0, 1, 2])
+    sp1, at1 = m1.recprompt_wrap_v2(enc1, batch, None, prompt1)
+    dec = m1.llama_tokenizer.decode(
+        m1.llama_tokenizer(prompt1.replace("<ItemTitleList>", batch["InteractedItemTitles"][0])
+                           .replace("<TargetItemTitle>", batch["TargetItemTitle"][0]),
+                           add_special_tokens=False).input_ids)
+    check("stage 1: history titles are spliced into the prompt text",
+          batch["InteractedItemTitles"][0].split('", "')[0].strip('"')[:12] in dec,
+          f"...{dec[60:130]}...")
+
+    before1 = {n: p.detach().clone() for n, p in m1.named_parameters() if p.requires_grad}
+    out1 = m1.forward_v2(batch)
+    check("stage 1: forward loss is finite", bool(torch.isfinite(out1["loss"])),
+          f"loss={float(out1['loss']):.4f}")
+    out1["loss"].backward()
+    g1 = [n for n, p in m1.named_parameters()
+          if p.requires_grad and (p.grad is None or float(p.grad.abs().sum()) == 0)]
+    # lora_A gets zero grad at init because lora_B starts at zero -- expected
+    check("stage 1: LoRA receives gradients (lora_B at minimum)",
+          len(g1) < len(before1), f"{len(before1) - len(g1)}/{len(before1)} nonzero")
+    opt1 = torch.optim.AdamW([p for p in before1.values() if True] and
+                             [p for n, p in m1.named_parameters() if p.requires_grad], lr=1e-3)
+    opt1.step()
+    moved = [n for n, p in m1.named_parameters()
+             if p.requires_grad and not torch.equal(p.detach(), before1[n])]
+    check("stage 1: an optimizer step actually moves LoRA weights",
+          len(moved) > 0, f"{len(moved)}/{len(before1)} tensors changed")
+    m1.eval()
+    ev1 = m1.generate_for_samples(batch)
+    check("stage 1: eval returns finite logits",
+          bool(torch.isfinite(ev1["logits"]).all()) and ev1["logits"].shape[0] == 16)
+    check("stage 1: eval has no n_prompt_tokens (why the runsheet shows prompt_tokens=nan)",
+          "n_prompt_tokens" not in ev1)
+    del m1
+
     # ------------------------------------------------- fp16/GradScaler contract
     # The gap that let `ValueError: Attempting to unscale FP16 gradients` reach a
     # real run: every test here used amp: False, so the GradScaler path with an

@@ -433,9 +433,93 @@ Practical notes:
   §8 fires loudly rather than corrupting the prompt silently.
 
 ```python
-!sed -i 's#batch_size_train: 32#batch_size_train: 16#' train_configs/stage1_lora_ml1m.yaml  # 40GB A100
-!python train_qformer.py --cfg-path train_configs/stage1_lora_ml1m.yaml 2>&1 | tail -40
+# 40 GB A100: halve the batch -- AND double max_epoch, or you halve the sample budget too
+!sed -i 's#batch_size_train: 32#batch_size_train: 16#' train_configs/stage1_lora_ml1m.yaml
+!sed -i 's#max_epoch: 60#max_epoch: 120#'              train_configs/stage1_lora_ml1m.yaml
+!python train_qformer.py --cfg-path train_configs/stage1_lora_ml1m.yaml
 ```
+
+**"epoch" here does not mean a pass over the data.** CoLLM's runner validates every
+`iters_per_epoch` steps, and stage 1 sets that to 100. So one "epoch" is
+`100 x batch_size` samples:
+
+| batch | samples per "epoch" | share of the 33 891 train rows | 60 "epochs" |
+|---|---|---|---|
+| 32 | 3 200 | 9.4 % | 5.7 real passes |
+| 16 | 1 600 | **4.7 %** | **2.8 real passes** |
+
+Two consequences worth internalising before you judge a run:
+
+* **The first `[valid]` line is after ~1 600 samples.** Expect it to be ~0.50 AUC. It is not
+  a failure signal. LoRA's `lora_B` is zero-initialised, so at step 0 the adapter contributes
+  exactly nothing and you are reading base Vicuna zero-shot on the TALLRec prompt — which is
+  about chance on ML-1M. Judge the *trend* and `best_epoch`, never epoch 0.
+* **Reducing the batch silently reduces total training**, because the step count is fixed by
+  `max_epoch x iters_per_epoch`. Halving the batch to fit 40 GB halves the samples seen, so
+  double `max_epoch` to keep the budget.
+
+Read the trend rather than the last line:
+
+```python
+import json, glob
+log = sorted(glob.glob('/content/logs/stage1_ml1m/*/log.txt'))[-1]
+rows = [json.loads(l) for l in open(log) if l.startswith('{') and 'valid_auc' in l]
+for k, r in enumerate(rows):
+    print(f"epoch {k:3d}  auc={r['valid_auc']:.4f}  uauc={r['valid_uauc']:.4f}  "
+          f"best_epoch={r['valid_best_epoch']}")
+print(f"\nbest auc={max(r['valid_auc'] for r in rows):.4f}  "
+      f"best uauc={max(r['valid_uauc'] for r in rows):.4f}  over {len(rows)} validations")
+```
+
+Also check the loss is actually moving, which is the real "is it learning" signal:
+
+```python
+!grep "train epoch" /content/logs/stage1_ml1m/*/train.log | head -5
+!grep "train epoch" /content/logs/stage1_ml1m/*/train.log | tail -5
+```
+
+**If AUC rises, peaks around epoch 3, then decays back to chance, the lr is too high.**
+That exact curve was observed:
+
+```
+epoch 0  auc=0.5650   epoch 3  auc=0.6504  <- peak     epoch 7   auc=0.4916
+epoch 1  auc=0.5863   epoch 4  auc=0.6345              epoch 9   auc=0.4918
+epoch 2  auc=0.5510   epoch 5  auc=0.5349              epoch 11  auc=0.5170
+```
+
+The peak lands at epoch 3 for a reason, and it was two compounding faults, both now fixed:
+
+1. **The inherited warmup did not warm up.** CoLLM's schedule gates on the *global* step
+   (`total < warmup_steps`) but ramps on the *within-epoch* step. With the shipped
+   `warmup_steps: 300` and `iters_per_epoch: 100`, the ramp restarted every epoch and then
+   jumped straight to full lr:
+
+   | epoch | lr, old (broken) | lr, fixed |
+   |---|---|---|
+   | 0 | 1e-05 → 3.4e-04 | 1.0e-06 → 3.4e-05 |
+   | 1 | 1e-05 → 3.4e-04 *(restart)* | 3.4e-05 → 6.7e-05 |
+   | 2 | 1e-05 → 3.4e-04 *(restart)* | 6.7e-05 → 1.0e-04 |
+   | 3 | **1.0e-03** *(jump)* | 1.0e-04 |
+
+   So the model improved for three epochs only because the lr was accidentally small, and
+   collapsed the moment the real lr arrived. `linear_warmup_cosine_lr_scaled` now ramps on
+   the global step.
+2. **`init_lr: 1e-3` is a CIE-stage lr, not a LoRA one.** It is what CoLLM uses for its
+   mapping module; for LoRA on a 7B it is roughly 10x too high. Stage 1 now ships
+   `init_lr: 1e-4`, `min_lr: 1e-5`, `warmup_lr: 1e-6`.
+
+Your peak checkpoint is not lost: selection is on validation UAUC, so
+`checkpoint_best.pth` holds the best epoch (0.6348 in the run above), not the last one.
+Confirm with `valid_best_epoch` in the trend print. A collapsed tail wastes time but not the
+result — and it is likely how a 1e-3 run can still report a decent number.
+
+If AUC is still ~0.50 after 20+ validations **and** the loss is flat, it is undertraining:
+raise `max_epoch`, and check `warmup_steps` is small relative to
+`max_epoch x iters_per_epoch`.
+
+`prompt_tokens=nan` in the stage-1 `[valid]` line is expected, not a fault: stage 1 runs
+CoLLM's legacy `mini_gpt4rec_v2`, which does not report prompt length, so there is nothing to
+average. Stage 2/3 report a real number.
 
 Then copy the winner somewhere permanent and pin it:
 
@@ -490,16 +574,36 @@ train history item is a train item) and nonzero on valid/test.
 | `<output_dir>/<job_id>/log.txt` | JSON lines: the config, then one row per validation |
 | `<output_dir>/<job_id>/qformer_diagnostics.jsonl` | the `L x T` heatmap data |
 
-If a cell looks frozen with **no output for minutes**, that is Python block-buffering
-stdout (8 KB) because Colab's `!python` gives it a pipe, not a TTY — CoLLM reports progress
-with `print()`, so it accumulates. Measured on a real run before the fix: output stalled at
-12 511 bytes for 20 s, then dumped the remaining 5 KB at process exit. The entry point now
-calls `enable_live_output()` (line buffering) at startup, so this is handled; `python -u`
-does the same thing if you are driving a script of your own. Either way `train.log` is being
-written the whole time:
+**Never pipe a training run into `tail` or `head`.** `tail -30` cannot emit anything until
+its stdin closes, so it shows *nothing at all* until the run finishes — measured: 0 bytes
+for the entire run, then 3 943 bytes at exit. This is the usual reason a training cell looks
+dead. Just run the command bare, and Colab streams it:
 
 ```python
-!tail -f /content/logs/stage2_ml1m/*/train.log     # or just tail -20 in another cell
+!python train_qformer.py --cfg-path train_configs/stage2_qformer_ml1m.yaml
+```
+
+If you want a saved copy too, use `tee`, which passes data through as it arrives (measured
+live from t=5 s):
+
+```python
+!python train_qformer.py --cfg-path train_configs/stage2_qformer_ml1m.yaml 2>&1 \
+    | tee /content/logs/stage2_run.log
+```
+
+`grep` in a pipe has the same problem unless you give it `--line-buffered`.
+
+A second, independent cause of a silent cell is Python block-buffering stdout (8 KB) because
+`!python` hands it a pipe rather than a TTY — CoLLM reports progress with `print()`, so it
+accumulates. Measured before the fix: stalled at 12 511 bytes for 20 s, then dumped 5 KB at
+exit. The entry point now calls `enable_live_output()` at startup, so this is handled
+(`python -u` does the same for scripts of your own).
+
+Either way `train.log` is written continuously, so you can watch from a second cell while
+the first one runs:
+
+```python
+!tail -f /content/logs/stage2_ml1m/*/train.log     # or tail -20 for a snapshot
 ```
 
 | Watch | Healthy | If not |
@@ -780,6 +884,10 @@ overhead is what makes Drive-backed runs slow.
 | `OSError: Incorrect path_or_model_id: '.../vicuna-7b-v0'` | the config's Vicuna path is a placeholder, and no merged `vicuna-7b-v0` exists on the Hub | see §5.0: apply the delta, use a merged mirror, or switch to v1.5 and re-run the baselines |
 | `ValueError: Attempting to unscale FP16 gradients` | Vicuna loads in fp16 and peft ≥0.5 casts LoRA adapters to the base dtype, so the only trainable tensors in stage 1/3 are fp16 — `GradScaler` rejects those in `step()` as well as `unscale_()` | keep `run.fp32_trainable: True` (the default): the runner casts trainable params to fp32 and leaves the backbone fp16. CoLLM avoided this only by pinning peft 0.4.0, which created fp32 adapters |
 | `loss=nan`, all params finite, log mentions `LOAD REPORT` or `v4.50` | transformers 5.x corrupting the vendored LLaMA's rotary buffers | `pip install "transformers==4.36.2" "peft==0.9.0"` **and restart the runtime**. `LOAD REPORT` appears only in 5.x, so it is a reliable tell |
+| stage-1 AUC ~0.50 at the first validation | expected — that is after `iters_per_epoch x batch` = ~1 600 samples, and LoRA's `lora_B` starts at zero so the adapter contributes nothing yet | judge the trend and `best_epoch`, not epoch 0 |
+| stage-1 AUC never leaves ~0.50 and the loss is flat | too little training, or `init_lr` too high for LoRA | you halved the batch without raising `max_epoch` (see §5.1); then try `init_lr: 3e-4` |
+| `prompt_tokens=nan` in a stage-1 `[valid]` line | the legacy arch does not report prompt length | expected; stage 2/3 report it |
+| training cell shows **nothing at all** until it finishes | the command is piped into `tail`/`head`, which cannot emit until stdin closes | drop the pipe, or use `\| tee run.log`; watch `train.log` from another cell |
 | cell shows no output for minutes, then a burst | Python block-buffers stdout on a pipe | handled by `enable_live_output()`; for your own scripts use `python -u`. `train.log` is written live regardless |
 | `RuntimeError: incompatible environment` at startup | the fail-fast check working as intended | read the `[compat] PROBLEM:` lines directly above it |
 | `Failed building wheel for tokenizers` | `transformers==4.28.0` wants `tokenizers<0.14`, which has no cp312 wheel | use the §1 pins (`transformers==4.36.2`); do **not** use CoLLM's `requirements.txt` |

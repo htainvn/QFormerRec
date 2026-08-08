@@ -52,7 +52,24 @@ class _CPULoader:
 
 @registry.register_lr_scheduler("linear_warmup_cosine_lr_scaled")
 class LinearWarmupCosineLRSchedulerScaled:
-    """Same schedule as CoLLM's ``linear_warmup_cosine_lr``, times ``lr_scale``."""
+    """CoLLM's ``linear_warmup_cosine_lr``, times ``lr_scale``, with the warmup fixed.
+
+    CoLLM's warmup gates on the *global* step (``total < warmup_steps``) but ramps
+    on the *within-epoch* step (``cur_step``). Whenever ``warmup_steps`` exceeds
+    ``iters_per_epoch`` -- which is the shipped stage-1 setting, 300 vs 100 -- the
+    ramp therefore restarts every epoch and the lr sawtooths, then jumps straight
+    to the full ``init_lr`` the moment the global step passes ``warmup_steps``:
+
+        epoch 0   1e-05 -> 3.4e-04      (ramp)
+        epoch 1   1e-05 -> 3.4e-04      (ramp again)
+        epoch 2   1e-05 -> 3.4e-04      (and again)
+        epoch 3   1.0e-03              <- jump to full lr, no warmup benefit at all
+
+    That produces the classic rise-then-collapse curve: the model improves while
+    the lr is accidentally small, peaks at the end of "warmup", then degrades once
+    the real lr lands. Ramping on ``total`` gives the monotonic warmup that was
+    intended.
+    """
 
     def __init__(self, optimizer, max_epoch, iters_per_epoch, min_lr, init_lr,
                  warmup_steps=0, warmup_start_lr=-1, **kwargs):
@@ -64,18 +81,17 @@ class LinearWarmupCosineLRSchedulerScaled:
         self.warmup_steps = warmup_steps
         self.warmup_start_lr = warmup_start_lr if warmup_start_lr >= 0 else init_lr
 
-    def step(self, cur_epoch, cur_step):
+    def lr_at(self, cur_epoch, cur_step):
         total = cur_epoch * self.iters_per_epoch + cur_step
         if total < self.warmup_steps:
-            lr = min(
-                self.init_lr,
-                self.warmup_start_lr
-                + (self.init_lr - self.warmup_start_lr) * cur_step / max(self.warmup_steps, 1),
-            )
-        else:
-            lr = (self.init_lr - self.min_lr) * 0.5 * (
-                1.0 + math.cos(math.pi * total / (self.max_epoch * self.iters_per_epoch))
-            ) + self.min_lr
+            frac = total / max(self.warmup_steps, 1)          # global, not per-epoch
+            return self.warmup_start_lr + (self.init_lr - self.warmup_start_lr) * frac
+        return (self.init_lr - self.min_lr) * 0.5 * (
+            1.0 + math.cos(math.pi * total / (self.max_epoch * self.iters_per_epoch))
+        ) + self.min_lr
+
+    def step(self, cur_epoch, cur_step):
+        lr = self.lr_at(cur_epoch, cur_step)
         for pg in self.optimizer.param_groups:
             pg["lr"] = lr * pg.get("lr_scale", 1.0)
 

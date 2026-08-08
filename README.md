@@ -163,6 +163,13 @@ Found while building this; all are load-bearing.
    casts trainable params back to fp32 (`run.fp32_trainable`, default on), which restores
    the precision CoLLM trained with and is the standard mixed-precision LoRA arrangement.
 
+10. **CoLLM's warmup does not warm up when `warmup_steps > iters_per_epoch`.** It gates on
+   the global step but ramps on the within-epoch step, so the lr sawtooths for the warmup
+   period and then jumps to the full `init_lr` in one step — the shipped stage-1 setting
+   (300 vs 100) hits this. The visible symptom is a run that improves for exactly
+   `warmup_steps / iters_per_epoch` epochs, peaks, then decays to chance.
+   `linear_warmup_cosine_lr_scaled` ramps on the global step instead.
+
 And one bug of our own worth recording: `L_attn`'s Bhattacharyya coefficient needs an
 `eps` inside the `sqrt`. Masked memory slots get exactly zero attention and
 `d/dx √x → ∞` at 0, so the plain formula NaNs every gradient on essentially every real
