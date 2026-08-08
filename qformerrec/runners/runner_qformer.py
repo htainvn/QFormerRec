@@ -25,6 +25,7 @@ from minigpt4.runners.runner_base_rec import RecRunnerBase
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
+from qformerrec.compat import attach_file_log, enable_live_output
 from qformerrec.datasets.samplers import UserGroupedBatchSampler
 
 PROTO_KEYS = ("memory_encoder.genre_proto", "memory_encoder.cluster_proto")
@@ -81,6 +82,18 @@ class LinearWarmupCosineLRSchedulerScaled:
 
 @registry.register_runner("rec_runner_qformer")
 class RecRunnerQFormer(RecRunnerBase):
+    def setup_output_dir(self):
+        """As the base, plus a real log file next to the checkpoint.
+
+        CoLLM's ``setup_logger`` installs only a StreamHandler, so a disconnected
+        Colab session loses every log line. ``train.log`` lands in the run dir and
+        is therefore picked up by the S3/Drive sync alongside the checkpoint and
+        ``qformer_diagnostics.jsonl``.
+        """
+        super().setup_output_dir()
+        enable_live_output()
+        attach_file_log(self.output_dir)
+
     @property
     def model(self):
         """Same as ``RunnerBase.model`` but safe when no move is needed.

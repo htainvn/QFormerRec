@@ -123,6 +123,12 @@ class RecQFormerTask(RecBaseTask):
 
             metric_logger.update(loss=loss.item())
             metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+            # MetricLogger reports progress with print(), which never reaches the
+            # log file; mirror it at the same cadence so train.log has the curve
+            if i % log_freq == 0 or i == iters_per_epoch - 1:
+                logging.info("train epoch %s iter %s/%s loss=%.4f lr=%.3e",
+                             inner_epoch, i, iters_per_epoch, loss.item(),
+                             optimizer.param_groups[0]["lr"])
             # CoLLM empties the cache every step, which is a real slowdown; only
             # do it if the config asks for it (OOM mitigation).
             if self.empty_cache_freq and (i + 1) % self.empty_cache_freq == 0:

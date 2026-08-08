@@ -30,8 +30,16 @@ sys.path.insert(0, HERE)
 
 # must run BEFORE minigpt4 is imported: it stubs `decord`, which CoLLM imports at
 # package level but which has no wheel for Python >= 3.11
-from qformerrec.compat import check_environment, install_import_shims  # noqa: E402
+from qformerrec.compat import (  # noqa: E402
+    attach_file_log,
+    check_environment,
+    enable_live_output,
+    install_import_shims,
+)
 
+# before anything prints: Colab's `!python` gives stdout an 8 KB block buffer, so
+# without this a long run looks frozen until the buffer fills
+enable_live_output()
 install_import_shims()
 
 import minigpt4.tasks as tasks  # noqa: E402

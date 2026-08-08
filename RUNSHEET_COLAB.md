@@ -481,6 +481,27 @@ and within a user it favours earlier rows, which have shorter histories. On the 
 it reads ~33–36 out of 50. `hist_unk_rate` is ~0 on train batches by construction (every
 train history item is a train item) and nonzero on valid/test.
 
+**Where the output goes.** Four places, and only two are files:
+
+| Sink | Contents |
+|---|---|
+| cell output | everything, live (stdout is made line-buffered at startup) |
+| `<output_dir>/<job_id>/train.log` | every `logging` record: param groups, the loss/lr curve, the diagnostics, eval metrics |
+| `<output_dir>/<job_id>/log.txt` | JSON lines: the config, then one row per validation |
+| `<output_dir>/<job_id>/qformer_diagnostics.jsonl` | the `L x T` heatmap data |
+
+If a cell looks frozen with **no output for minutes**, that is Python block-buffering
+stdout (8 KB) because Colab's `!python` gives it a pipe, not a TTY — CoLLM reports progress
+with `print()`, so it accumulates. Measured on a real run before the fix: output stalled at
+12 511 bytes for 20 s, then dumped the remaining 5 KB at process exit. The entry point now
+calls `enable_live_output()` (line buffering) at startup, so this is handled; `python -u`
+does the same thing if you are driving a script of your own. Either way `train.log` is being
+written the whole time:
+
+```python
+!tail -f /content/logs/stage2_ml1m/*/train.log     # or just tail -20 in another cell
+```
+
 | Watch | Healthy | If not |
 |---|---|---|
 | `pref_token_norm` vs `llm_emb_norm` | within 2× | the RMS matching is off — soft prompt will do nothing |
@@ -658,9 +679,9 @@ What each stage produces, and which command it needs:
 | 3 — joint | `/content/logs/stage3_*/<job_id>/` | **dir** | ~220 MB |
 | eval | `/content/logs/eval_*/<job_id>/` | **dir** | < 1 MB (metrics only) |
 
-Each run dir holds `checkpoint_best.pth`, `log.txt` (per-validation metrics) and
-`qformer_diagnostics.jsonl` — you want all three, not just the weights: the last two are
-deliverables 3–6.
+Each run dir holds `checkpoint_best.pth`, `train.log` (the full run log), `log.txt`
+(per-validation metrics) and `qformer_diagnostics.jsonl` — you want all four, not just the
+weights: the last three are deliverables 3–6, and together they are a few hundred KB.
 
 ```python
 import os
@@ -759,6 +780,7 @@ overhead is what makes Drive-backed runs slow.
 | `OSError: Incorrect path_or_model_id: '.../vicuna-7b-v0'` | the config's Vicuna path is a placeholder, and no merged `vicuna-7b-v0` exists on the Hub | see §5.0: apply the delta, use a merged mirror, or switch to v1.5 and re-run the baselines |
 | `ValueError: Attempting to unscale FP16 gradients` | Vicuna loads in fp16 and peft ≥0.5 casts LoRA adapters to the base dtype, so the only trainable tensors in stage 1/3 are fp16 — `GradScaler` rejects those in `step()` as well as `unscale_()` | keep `run.fp32_trainable: True` (the default): the runner casts trainable params to fp32 and leaves the backbone fp16. CoLLM avoided this only by pinning peft 0.4.0, which created fp32 adapters |
 | `loss=nan`, all params finite, log mentions `LOAD REPORT` or `v4.50` | transformers 5.x corrupting the vendored LLaMA's rotary buffers | `pip install "transformers==4.36.2" "peft==0.9.0"` **and restart the runtime**. `LOAD REPORT` appears only in 5.x, so it is a reliable tell |
+| cell shows no output for minutes, then a burst | Python block-buffers stdout on a pipe | handled by `enable_live_output()`; for your own scripts use `python -u`. `train.log` is written live regardless |
 | `RuntimeError: incompatible environment` at startup | the fail-fast check working as intended | read the `[compat] PROBLEM:` lines directly above it |
 | `Failed building wheel for tokenizers` | `transformers==4.28.0` wants `tokenizers<0.14`, which has no cp312 wheel | use the §1 pins (`transformers==4.36.2`); do **not** use CoLLM's `requirements.txt` |
 | `ModuleNotFoundError: No module named 'decord'` | no decord wheel for Python ≥3.11 | do not install it; entry points call `install_import_shims()` — if you wrote your own script, call it before importing `minigpt4` |

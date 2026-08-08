@@ -70,7 +70,7 @@ qformerrec/
   datasets/rec_datasets_qformer.py dataset + builders (fixes the ML-1M warm/cold split)
   datasets/samplers.py             UserGroupedBatchSampler (L_rank needs same-user pairs)
   metrics.py                       UAUC that does not depend on the sklearn version
-  compat.py                        import shims + environment check for modern Python
+  compat.py                        import shims, environment check, live output + file log
   tasks/rec_qformer_task.py        eval + grad clipping + timing
   runners/runner_qformer.py        per-group lr_scale, grouped sampler wiring, diagnostics
 scripts/

@@ -16,6 +16,7 @@ shim is only inserted when the genuine import fails.
 import importlib.machinery
 import importlib.util
 import logging
+import os
 import sys
 import types
 
@@ -69,6 +70,51 @@ def install_import_shims(verbose=True):
         print(msg)
         logging.info(msg)
     return shimmed
+
+
+def enable_live_output():
+    """Make stdout/stderr line-buffered so training progress appears as it happens.
+
+    Python block-buffers stdout (8 KB) whenever it is not a TTY, which is exactly
+    what Colab's ``!python ...`` and any ``> file`` redirect create. CoLLM's
+    ``MetricLogger.log_every`` reports progress with ``print()``, so on a long run
+    the output sits in that buffer and the cell looks frozen -- measured here:
+    a run's output stalled for 20 s and then dumped 5 KB at process exit.
+
+    ``line_buffering=True`` fixes it globally, for CoLLM's prints as well as ours,
+    with no need for ``python -u``.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)             # py3.7+
+        except (AttributeError, ValueError):                    # already wrapped
+            pass
+
+
+def attach_file_log(output_dir, filename="train.log"):
+    """Also write every ``logging`` record to ``<output_dir>/<filename>``.
+
+    Worth having on top of line buffering: CoLLM's ``setup_logger`` installs only a
+    ``StreamHandler``, so nothing survives a disconnected Colab session. A file in
+    the run directory gets picked up by the S3/Drive sync along with the
+    checkpoint and the diagnostics.
+    """
+    path = os.path.join(str(output_dir), filename)
+    root = logging.getLogger()
+    for h in root.handlers:                                     # idempotent
+        if isinstance(h, logging.FileHandler) and \
+                os.path.abspath(getattr(h, "baseFilename", "")) == os.path.abspath(path):
+            return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fh = logging.FileHandler(path)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    fh.setLevel(logging.INFO)
+    root.addHandler(fh)
+    if root.level > logging.INFO or root.level == logging.NOTSET:
+        root.setLevel(logging.INFO)
+    logging.info("logging to %s", path)
+    print(f"[compat] logging to {path}")
+    return path
 
 
 def check_vendored_llama():
