@@ -1,15 +1,18 @@
 # ---------------------------------------------------------------------------
-# Stage 3 -- low-lr joint anneal on top of stage 2.
+# Stage 3 -- T2-style MF tuning at 1/10 the stage-2 lr.
 #
 # Mirrors CoLLM's T1/T2 tuning, which is where its best numbers came from -- do
 # not skip it. Start from the stage-2 best checkpoint (`ckpt`) AND the stage-1
 # LoRA weights (`ckpt_lora`), since the stage-2 checkpoint only stores the
 # parameters that were trainable in stage 2.
 #
-# NOTE -- stage 3 is now an anneal, not an unfreeze. LoRA already trains in
-# stage 2 (freezing it there is what starved the Q-Former; see the stage-2
-# header). What still distinguishes this stage is the 10x lower lr, and
-# `freeze_rec: False` if you want CoLLM's T2-style MF tuning.
+# What this stage is for: LoRA moved up to stage 2 (freezing it there is what
+# starved the Q-Former; see the stage-2 header), so `freeze_rec: False` is now
+# the one thing stage 3 does that stage 2 does not. That also makes the
+# "stage-3 off" ablation in runsheet 6.3 meaningful -- it measures exactly what
+# tuning the collaborative model buys. AUC is the metric to watch here: nothing
+# in the loss optimises it directly, and closing the gap to CoLLM-MF T2 (0.7418
+# test) is what unfreezing MF is for.
 #
 # PRECONDITION -- stage 3 inherits whatever stage 2 produced. The previous
 # collapse here was not independent: stage 2's `checkpoint_best.pth` was its
@@ -20,7 +23,12 @@
 model:
   arch: mini_gpt4rec_qformer
   model_type: pretrain_vicuna
-  freeze_rec: True            # False for the final runs (T2-style tuning)
+  # T2-style tuning, and the ONE thing that distinguishes this stage from stage 2.
+  # Held back until here on purpose: MF is a 1.05M lookup table (839 users + 3256
+  # items x 256) serving the 740 users that appear in training at ~46 rows each --
+  # the same memorisation shape that <UserID> had. Stage 2 must be stable before
+  # it opens. Expect `'rec': 1048320` in the `by group` line.
+  freeze_rec: False
   freeze_proj: True           # MUST match stage 2 -- no <UserID> in the prompt
   freeze_lora: False          # trains in stage 2 too, just slower here
   max_txt_len: 1024
@@ -126,7 +134,11 @@ run:
     qformer: 1.0              # 5e-6
     proj: 0.1                 # 5e-7  -- same shortcut throttle as stage 2
     proto: 1.0                # 5e-6
-    rec: 0.1                  # 5e-7
+    # MF was pretrained at lr 1e-3 (scripts/pretrain_mf.py). At the old 0.1 this
+    # would be 5e-7 -- 2000x below that, i.e. frozen in all but name, and the run
+    # would look like "tuning MF does nothing" when it simply never moved.
+    # 2.0 x 5e-6 = 1e-5 is 1/100 of the pretrain lr, a normal fine-tune ratio.
+    rec: 2.0                  # 1e-5
     lora: 2.0                 # 1e-5  -- keeps stage 2's ratio at stage 3's lr/10
 
   user_grouped_sampler: True  # required by L_rank; False ablates it cleanly
@@ -137,8 +149,11 @@ run:
   # raised from 1e-3: weight decay is the only regulariser that reaches llama_proj,
   # since model.qformer.dropout only applies to the Q-Former side (~21% of params)
   weight_decay: 1e-2
-  max_epoch: 8                # 8 x 200 iters x 48 rows ~ 2 real epochs
-  iters_per_epoch: 200
+  # Same 1600 steps as before, but 32 validations instead of 8. Stage 2 peaked at
+  # step 250, so a 200-step grid would step straight over the peak and checkpoint
+  # something worse.
+  max_epoch: 32               # 32 x 50 iters x 48 rows = 1600 steps
+  iters_per_epoch: 50
   batch_size_train: 48        # ignored while user_grouped_sampler is on
   batch_size_eval: 64
   num_workers: 4
