@@ -17,7 +17,7 @@
 set -euo pipefail
 
 : "${ENDPOINT_URL:?set ENDPOINT_URL}"
-: "${BUCKET:=s3://qformerrec}"
+: "${BUCKET:?set BUCKET, e.g. s3://sigllm/qformerrec}"
 : "${RUN:?set RUN, e.g. RUN=ml1m-pit-k50}"
 CKPT_DIR="${CKPT_DIR:-/content/ckpt}"
 LOGS_DIR="${LOGS_DIR:-/content/logs}"
@@ -27,6 +27,23 @@ DIR=${1:-up}
 WHAT=${2:-all}
 S3="aws --endpoint-url=$ENDPOINT_URL s3"
 EXCL=(--exclude "*/result/*" --exclude "*.tmp" --exclude "*/vicuna*/*")
+
+# Preflight: `aws s3 sync` never creates a bucket, it just fails with
+# "NoSuchBucket ... ListObjectsV2", which does not say which name was wrong or
+# that BUCKET may simply be a placeholder. Check first and say something useful.
+BUCKET_NAME=$(printf '%s' "$BUCKET" | sed -E 's#^s3://##; s#/.*$##')
+if ! $S3 ls "s3://$BUCKET_NAME" >/dev/null 2>&1; then
+    echo "ERROR: bucket '$BUCKET_NAME' is not reachable at $ENDPOINT_URL" >&2
+    echo "       (BUCKET=$BUCKET -> bucket '$BUCKET_NAME')" >&2
+    echo >&2
+    echo "  BUCKET defaults to a placeholder; point it at a bucket you own. To reuse an" >&2
+    echo "  existing one, put this project under a prefix:" >&2
+    echo "      export BUCKET=s3://<your-bucket>/qformerrec" >&2
+    echo "  Buckets you can see at this endpoint:" >&2
+    $S3 ls 2>&1 | sed 's/^/      /' >&2
+    echo "  Or create it:  aws --endpoint-url=\"\$ENDPOINT_URL\" s3 mb s3://$BUCKET_NAME" >&2
+    exit 3
+fi
 
 sync_pair() {           # $1 local  $2 remote-suffix
     local local_path="$1" remote="$BUCKET/$2/$RUN/"

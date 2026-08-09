@@ -939,6 +939,20 @@ What each stage produces, and which command it needs:
 | 3 — joint | `/content/logs/stage3_*/<job_id>/` | **dir** | ~220 MB |
 | eval | `/content/logs/eval_*/<job_id>/` | **dir** | < 1 MB (metrics only) |
 
+> **If a checkpoint comes out at 13.5 GB, it was written by the unfixed saver.**
+> CoLLM's `_save_checkpoint` drops frozen weights *by key name*, but
+> `named_parameters()` deduplicates by tensor identity while `state_dict()` does not.
+> peft leaves the backbone reachable under two prefixes (`llama_model.*` and
+> `llama_model_lora.base_model.*`), so every frozen weight appears twice in
+> `state_dict()` and only once in the name→requires_grad map. The
+> `llama_model_lora.*` copies are never in that map, the `k in param_grad_dic` test
+> is False, and the whole frozen Vicuna is written out — a stage-1 "LoRA"
+> checkpoint of **13.5 GB, 0.2 % of it LoRA**. The saver here filters on
+> `id(tensor)` instead, which is immune to the aliasing: measured **3.2 MB** for
+> the same stage-2 checkpoint, with zero frozen tensors, and it reloads bit-exactly.
+> Old 13.5 GB checkpoints still load fine — they are merely 400x too big, so delete
+> them once you have re-saved: `!du -sh /content/logs/*/*/checkpoint_best.pth`.
+
 Each run dir holds `checkpoint_best.pth`, `train.log` (the full run log), `log.txt`
 (per-validation metrics) and `qformer_diagnostics.jsonl` — you want all four, not just the
 weights: the last three are deliverables 3–6, and together they are a few hundred KB.
@@ -946,11 +960,21 @@ weights: the last three are deliverables 3–6, and together they are a few hund
 ```python
 import os
 os.environ["ENDPOINT_URL"] = "https://<your-endpoint>"     # same var as your other projects
-RUN = "ml1m-pit-k50"        # tag this run; mirrors the `sella-aug` slot in your commands
-os.environ["RUN"] = RUN
-BUCKET = "s3://qformerrec"
-os.environ["BUCKET"] = BUCKET
+os.environ["RUN"]    = "ml1m-pit-k50"   # tag this run; the `sella-aug` slot in your commands
+# Use a bucket you already own, with this project under a prefix. `aws s3` never
+# creates buckets, so a name that does not exist fails with
+#   fatal error: An error occurred (NoSuchBucket) ... ListObjectsV2
+os.environ["BUCKET"] = "s3://sigllm/qformerrec"            # <-- your bucket + a prefix
 ```
+
+Confirm the bucket before syncing 200 MB at it:
+
+```python
+!aws --endpoint-url="$ENDPOINT_URL" s3 ls                       # buckets you can see
+!aws --endpoint-url="$ENDPOINT_URL" s3 ls "$BUCKET/" || echo "prefix empty (fine, it is new)"
+```
+
+If you would rather have a dedicated bucket: `!aws --endpoint-url="$ENDPOINT_URL" s3 mb s3://qformerrec`.
 
 ```python
 # --- stage 0 + 0b. These are FILES, so `cp`, not `sync` (`s3 sync` requires a
@@ -1019,6 +1043,10 @@ Practical notes:
   place whenever validation UAUC improves, so a mid-write copy can be truncated.
 * `sync` compares size and mtime, so re-running it is cheap and idempotent.
 * If `aws` is missing from the runtime: `!pip -q install awscli`.
+* `NoSuchBucket ... ListObjectsV2` means `BUCKET` names a bucket that does not exist —
+  most likely still the placeholder. `aws s3 sync` does not create buckets. Either point
+  `BUCKET` at one you own (a prefix is fine: `s3://sigllm/qformerrec`) or `s3 mb` it.
+  `scripts/s3_sync.sh` now preflights this and lists the buckets it can see.
 
 ### 7.3 Or just use Drive
 

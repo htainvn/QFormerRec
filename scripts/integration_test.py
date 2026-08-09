@@ -407,6 +407,61 @@ def main():
                   if not n.startswith(("llama_model.", "llama_model_lora."))}
             torch.save({"model": sd}, os.path.join(args.work_dir, "stage2_ckpt.pth"))
 
+    # ------------------------------------------------- checkpoint contents/size
+    # CoLLM's save filter is defeated by peft's module aliasing and writes the whole
+    # frozen backbone: a real stage-1 "LoRA" checkpoint came to 13.5 GB, 0.2% LoRA.
+    print("\n=== checkpoint contains only trainable tensors ===")
+    ck_dir = os.path.join(args.work_dir, "out_ckpt")
+    os.makedirs(ck_dir, exist_ok=True)
+    ck_model = mmod.MiniGPT4RecQFormer.from_config(build_cfg(args, llama_path, 2).model).float()
+    runner_cls = registry.get_runner_class("rec_runner_qformer")
+
+    class _Shim:                       # only what _save_checkpoint touches
+        output_dir = ck_dir
+        scaler = None
+        model = ck_model
+        optimizer = torch.optim.AdamW(
+            [p for p in ck_model.parameters() if p.requires_grad], lr=1e-3)
+        config = type("C", (), {"to_dict": staticmethod(lambda: {})})()
+
+        @staticmethod
+        def unwrap_dist_model(m):
+            return m
+
+    runner_cls._save_checkpoint(_Shim(), 0, is_best=True)
+    ck_path = os.path.join(ck_dir, "checkpoint_best.pth")
+    saved_ck = torch.load(ck_path, map_location="cpu", weights_only=False)["model"]
+    leaked = [k for k in saved_ck if k.startswith("llama_model") and "lora_" not in k]
+    check("no frozen LLM weights in the checkpoint", not leaked,
+          f"{len(leaked)} leaked, e.g. {leaked[:1]}")
+    n_ck = sum(v.numel() for v in saved_ck.values())
+    n_tr = sum(p.numel() for p in ck_model.parameters() if p.requires_grad)
+    check("checkpoint params ~= trainable params (aliases may duplicate)",
+          n_tr <= n_ck <= 2 * n_tr, f"ckpt={n_ck:,} trainable={n_tr:,}")
+    check("checkpoint file is small", os.path.getsize(ck_path) / 1e6 < 50,
+          f"{os.path.getsize(ck_path)/1e6:.1f} MB")
+    # the same filter applied CoLLM's way, for contrast
+    grad_d = {k: v.requires_grad for k, v in ck_model.named_parameters()}
+    collm_sd = ck_model.state_dict()
+    for k in list(collm_sd):
+        if k in grad_d and not grad_d[k]:
+            del collm_sd[k]
+    collm_leak = [k for k in collm_sd if k.startswith("llama_model") and "lora_" not in k]
+    check("control: CoLLM's name-based filter DOES leak the backbone",
+          len(collm_leak) > 0,
+          f"{len(collm_leak)} frozen tensors, "
+          f"{sum(collm_sd[k].numel() for k in collm_leak)/1e6:.1f}M params")
+    # and it must still be loadable
+    c_re = build_cfg(args, llama_path, 2)
+    c_re.model.ckpt = ck_path
+    reloaded = mmod.MiniGPT4RecQFormer.from_config(c_re.model).float()
+    gr, g0 = dict(reloaded.named_parameters()), dict(ck_model.named_parameters())
+    keys = [k for k in saved_ck if k in gr]
+    dmax = max(float((gr[k].detach().float() - g0[k].detach().float()).abs().max())
+               for k in keys)
+    check("the slim checkpoint reloads exactly", dmax < 1e-5, f"max diff={dmax:.2e}")
+    del ck_model, reloaded
+
     # ------------------------------------------- stage-1 -> stage-2 LoRA handoff
     # A silent failure here would look exactly like "stage 2 is worse than stage 1":
     # the LoRA would be at init while the prompt had already changed.

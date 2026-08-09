@@ -9,7 +9,10 @@ Adds four things CoLLM's ``RecRunnerBase`` cannot express:
    stage-2/3 table (Q-Former 1x, prototypes 1x, MF 0.1x, LoRA 0.1x).
 2. **The user-grouped batch sampler**, needed by ``L_rank``.
 3. **Q-Former diagnostics** written once per epoch to the output dir.
-4. **A configurable, reported early stop.** CoLLM hard-codes patience at 20
+4. **Checkpoints that contain only the trainable tensors.** CoLLM's filter is
+   defeated by peft's module aliasing and writes the whole frozen Vicuna --
+   13.5 GB for a stage-1 "LoRA" checkpoint, 0.2% of it LoRA.
+5. **A configurable, reported early stop.** CoLLM hard-codes patience at 20
    validations and never says how close it is; ``run.patience`` sets it and every
    validation logs the gap to the stop.
 """
@@ -23,7 +26,12 @@ import time
 import torch
 import torch.distributed as dist
 import webdataset as wds
-from minigpt4.common.dist_utils import get_rank, get_world_size, is_main_process
+from minigpt4.common.dist_utils import (
+    get_rank,
+    get_world_size,
+    is_main_process,
+    main_process,
+)
 from minigpt4.common.registry import registry
 from minigpt4.datasets.data_utils import ChainDataset
 from minigpt4.datasets.datasets.dataloader_utils import IterLoader, MultiIterLoader, PrefetchLoader
@@ -190,6 +198,54 @@ class RecRunnerQFormer(RecRunnerBase):
         logging.info("Training time %s",
                      str(datetime.timedelta(seconds=int(time.time() - start_time))))
         self.set_model_mode(None)
+
+    @main_process
+    def _save_checkpoint(self, cur_epoch, is_best=False):
+        """Save only the trainable tensors -- filtered by identity, not by name.
+
+        CoLLM's version drops frozen weights by key name::
+
+            param_grad_dic = {k: v.requires_grad for k, v in model.named_parameters()}
+            for k in list(state_dict):
+                if k in param_grad_dic and not param_grad_dic[k]:
+                    del state_dict[k]
+
+        but ``named_parameters()`` **deduplicates by tensor identity** while
+        ``state_dict()`` does not. peft leaves the base model reachable under two
+        prefixes (``llama_model.*`` and ``llama_model_lora.base_model.*``), so every
+        frozen weight appears twice in ``state_dict()`` and only once in
+        ``param_grad_dic``. The ``llama_model_lora.*`` copies are therefore never in
+        ``param_grad_dic``, the ``k in param_grad_dic`` test is False, and they
+        survive: the whole frozen Vicuna gets written out. Measured on the real
+        thing, a stage-1 "LoRA" checkpoint came to **13.5 GB, of which 0.2% was
+        LoRA**.
+
+        Filtering on ``id(tensor)`` is immune to the aliasing. ``keep_vars=True`` is
+        what makes it work -- the default ``state_dict()`` returns detached *copies*,
+        whose ids would never match.
+        """
+        model_no_ddp = self.unwrap_dist_model(self.model)
+        trainable = {id(p) for p in model_no_ddp.parameters() if p.requires_grad}
+        # both aliases of a trainable tensor are kept: costs a few MB and makes the
+        # checkpoint loadable whichever prefix the reader expects
+        state_dict = {k: v.detach().cpu()
+                      for k, v in model_no_ddp.state_dict(keep_vars=True).items()
+                      if id(v) in trainable}
+        save_obj = {
+            "model": state_dict,
+            "optimizer": self.optimizer.state_dict(),
+            "config": self.config.to_dict(),
+            "scaler": self.scaler.state_dict() if self.scaler else None,
+            "epoch": cur_epoch,
+        }
+        save_to = os.path.join(
+            self.output_dir, "checkpoint_{}.pth".format("best" if is_best else cur_epoch)
+        )
+        torch.save(save_obj, save_to)
+        n = sum(v.numel() for v in state_dict.values())
+        size_mb = os.path.getsize(save_to) / 1e6
+        logging.info("Saved checkpoint at epoch %s to %s (%d tensors, %.1fM params, %.1f MB)",
+                     cur_epoch, save_to, len(state_dict), n / 1e6, size_mb)
 
     def setup_output_dir(self):
         """As the base, plus a real log file next to the checkpoint.
