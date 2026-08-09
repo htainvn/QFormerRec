@@ -103,7 +103,7 @@ model:
     lambda_rank: 0.5
     lambda_cf: 0.2
     lambda_div: 0.1
-    lambda_attn: 0.05
+    lambda_attn: 0.3            # MUST match stage 2 -- see its note
     lambda_var: 0.05
     lambda_align: 0.0
     rank_score: yes_minus_no  # s = logit(Yes) - logit(No) for L_rank
