@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Stage 3 -- T2-style MF tuning at 1/10 the stage-2 lr.
+# Stage 3 -- T2-style MF tuning at the stage-2 lr (see the init_lr note below).
 #
 # Mirrors CoLLM's T1/T2 tuning, which is where its best numbers came from -- do
 # not skip it. Start from the stage-2 best checkpoint (`ckpt`) AND the stage-1
@@ -115,8 +115,16 @@ run:
   task: rec_qformer
   runner: rec_runner_qformer
   lr_sched: "linear_warmup_cosine_lr_scaled"
-  init_lr: 5e-6               # stage 3 = stage-2 lrs / 10
-  min_lr: 5e-7
+  # NOT stage-2/10 any more. That convention assumes stage 2 ends mid-descent so
+  # stage 3 has something to anneal; stage 2 now ends FLAT (train ~= valid ~= 0.65,
+  # both static), so dividing by 10 produced a run where nothing moved at all --
+  # `proj_scale` sat at 0.0203 for the entire run, train loss went 0.644 -> 0.634,
+  # AUC 0.6945 -> 0.6972. The experiment did not fail, it never ran.
+  # MF is the thing this stage exists to tune and it was pretrained at lr 1e-3
+  # (scripts/pretrain_mf.py) over 5000 epochs at batch 2048. `rec: 2.0` x 5e-5 puts
+  # it at 1e-4 = 1/10 of that, which can actually move a 1.05M table.
+  init_lr: 5e-5
+  min_lr: 5e-6
   warmup_lr: 1e-6
   mode: 'v2'
   select_metric: uauc
@@ -131,15 +139,15 @@ run:
   fp32_trainable: True
 
   lr_scale:                   # effective lr = init_lr * scale
-    qformer: 1.0              # 5e-6
+    qformer: 1.0              # 5e-5
     proj: 0.1                 # 5e-7  -- same shortcut throttle as stage 2
     proto: 1.0                # 5e-6
     # MF was pretrained at lr 1e-3 (scripts/pretrain_mf.py). At the old 0.1 this
     # would be 5e-7 -- 2000x below that, i.e. frozen in all but name, and the run
     # would look like "tuning MF does nothing" when it simply never moved.
     # 2.0 x 5e-6 = 1e-5 is 1/100 of the pretrain lr, a normal fine-tune ratio.
-    rec: 2.0                  # 1e-5
-    lora: 2.0                 # 1e-5  -- keeps stage 2's ratio at stage 3's lr/10
+    rec: 2.0                  # 1e-4  -- 1/10 of MF's pretrain lr
+    lora: 2.0                 # 1e-4  -- same as stage 2
 
   user_grouped_sampler: True  # required by L_rank; False ablates it cleanly
   users_per_batch: 8          # U
@@ -152,12 +160,12 @@ run:
   # Same 1600 steps as before, but 32 validations instead of 8. Stage 2 peaked at
   # step 250, so a 200-step grid would step straight over the peak and checkpoint
   # something worse.
-  max_epoch: 32               # 32 x 50 iters x 48 rows = 1600 steps
+  max_epoch: 80               # 80 x 50 iters x 48 rows = 4000 steps
   iters_per_epoch: 50
   batch_size_train: 48        # ignored while user_grouped_sampler is on
   batch_size_eval: 64
   num_workers: 4
-  warmup_steps: 80            # 5% of 1600 total iters
+  warmup_steps: 200           # 5% of 4000 total iters
   empty_cache_freq: 0
 
   seed: 42
