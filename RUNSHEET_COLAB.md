@@ -705,6 +705,19 @@ before touching anything else. If it destabilises again, the next suspect is `ll
 11.2M freshly-initialised parameters writing straight into embedding space against ~800k for
 the Q-Former core, so it has its own lr group — try `--options run.lr_scale.proj=0.3`.
 
+**Progress across three stage-2 runs**, so you can see which change bought what:
+
+| run | best valid UAUC | at | samples seen |
+|---|---|---|---|
+| `lr 1e-3`, `iters_per_epoch 200` | 0.6451 | epoch 0 | 9 600 |
+| `lr 3e-4`, `iters_per_epoch 200` | 0.6303 | epoch 0 | 9 600 |
+| `lr 3e-4`, `iters_per_epoch 50` | **0.6575** | epoch 1 | **4 800** |
+
+The third run **beats stage 1's best (0.6348) on a 2.4x shorter prompt** — the Q-Former is
+earning its place. But it still peaks after ~100 steps and then only degrades, which is the
+part that is not healthy, and the finer validation only *caught* the peak rather than moving
+it. Early stopping then ended the run at epoch 21 with the right checkpoint.
+
 **After fixing the lr, the remaining failure looks different — and needs the opposite fix.**
 A second observed run, at `3e-4`:
 
@@ -734,8 +747,27 @@ Two responses, in order:
    `100` (Amazon) with `max_epoch` raised to keep the same step budget. Combined with
    `patience`, this run is *cheaper* than the coarse one, because it stops as soon as it
    plateaus instead of grinding through 40 epochs of memorisation.
-2. **Then regularise**, following the spec: `dropout: 0.2` (from 0.1), `weight_decay: 1e-2`
-   (from 1e-3), and `k_neighbor: 4` (from 8):
+2. **Cut the capacity that is actually overfitting.** Where the trainable parameters sit,
+   for real Vicuna:
+
+   | block | params | share |
+   |---|---|---|
+   | `llama_proj` (`proj_mid_times: 10`) | **11.15 M** | **78.9 %** |
+   | `pref_proj` | 2.17 M | 15.3 % |
+   | Q-Former, 2 layers | 0.53 M | 3.7 % |
+   | memory encoder + query gen + CF head | 0.28 M | 2.0 % |
+   | total | 14.13 M | **417 params per training row** |
+
+   `llama_proj` — CoLLM's `<UserID>`/`<TargetItemID>` MLP — is four fifths of everything
+   trainable, and note that **its `nn.Dropout` is commented out in CoLLM**, so
+   `model.qformer.dropout` does not touch it at all (that only regularises the Q-Former
+   side, ~21 %). The levers that do reach it are capacity, weight decay and its lr scale.
+   Stage 2/3 therefore now ship `proj_mid_times: 2` (11.15 M → 2.23 M, a 5x cut) and
+   `weight_decay: 1e-2` (from 1e-3). **`proj_mid_times` must match between stage 2 and
+   stage 3**, or the stage-2 checkpoint will not load into stage 3.
+
+3. **Then the remaining knobs**, one at a time: `run.lr_scale.proj=0.3` (slow the same
+   block down), `model.qformer.dropout=0.2`, `model.qformer.memory.k_neighbor=4`:
 
 ```python
 !python train_qformer.py --cfg-path train_configs/stage2_qformer_ml1m.yaml \

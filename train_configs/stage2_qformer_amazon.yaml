@@ -19,7 +19,12 @@ model:
   max_txt_len: 1024
   proj_token_num: 1
   proj_drop: 0
-  proj_mid_times: 10
+  # llama_proj is nn.Sequential(Linear, ReLU, Linear) with its Dropout commented out in
+  # CoLLM, and at proj_mid_times=10 it is 11.15M params -- 79% of everything trainable
+  # here, 417 params per training row, with no dropout on it. That is the surface that
+  # overfits ML-1M's 33 891 rows within ~100 steps. 2 cuts it to 2.23M (5x).
+  # MUST match between stage 2 and stage 3, or the stage-2 checkpoint will not load.
+  proj_mid_times: 2
   end_sym: "###"
   prompt_path: "prompts/qformer_amazon.txt"
   prompt_template: '{}'
@@ -120,7 +125,9 @@ run:
   rows_per_user: 6            # m  -> real batch = 48, no grad accumulation
   strict_batch: True
 
-  weight_decay: 1e-3
+  # raised from 1e-3: weight decay is the only regulariser that reaches llama_proj,
+  # since model.qformer.dropout only applies to the Q-Former side (~21% of params)
+  weight_decay: 1e-2
   max_epoch: 120               # 30 x 400 iters x 48 rows ~ 3 real epochs
   # Validation cadence. The metric peaks INSIDE the first 200 steps on ML-1M,
   # so 200+ is too coarse to checkpoint the peak. Finer + early stopping is
