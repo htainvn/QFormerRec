@@ -130,7 +130,16 @@ model:
     # The mechanism does work: at init_lr 3e-4 loss_attn fell 0.9975 -> 0.1801 on
     # the same lambda. That lr collapses everything else, so raise lambda instead.
     # Read `loss_attn` to judge this knob -- it is independent of the metric.
-    lambda_attn: 0.3
+    #
+    # 0.3 overshot: loss_attn fell 0.9975 -> 0.1813, but into a degenerate
+    # solution -- token1 sat on cluster at 0.994, token2 AND token3 both on genre
+    # at 1.000, leaving only token0 reading hist+user. Each token collapsed onto a
+    # single slot type instead of reading complementary mixtures, so the
+    # personalised signal ended up compressed into one token out of four. uauc
+    # tracked that exactly: 0.6953 at epoch 4 while loss_attn was still ~0.99,
+    # down to 0.6508 by epoch 18 once loss_attn reached 0.18.
+    # Target loss_attn ~0.5-0.7: tokens distinct, still reading mixtures.
+    lambda_attn: 0.15
     lambda_var: 0.05
     lambda_align: 0.0
     rank_score: yes_minus_no  # s = logit(Yes) - logit(No) for L_rank
