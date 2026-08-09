@@ -33,12 +33,13 @@ model:
   arch: mini_gpt4rec_qformer
   model_type: pretrain_vicuna
   freeze_rec: True            # False for the final runs (T2-style tuning)
-  # <UserID> is a direct memorisation channel: llama_proj is 2.23M params serving
-  # only 740 ML-1M users (~3k params/user, ~46 labelled rows each), so "user X
-  # usually says Yes" is trivially learnable and does not transfer to the OOD
-  # split. With the prompt below there is no <UserID>/<TargetItemID> to splice,
-  # so llama_proj is unused -- freezing it drops those 2.23M from the optimizer.
-  freeze_proj: True
+  # llama_proj is back, but for <TargetItemID> ONLY. The memorisation channel was
+  # user-side, not item-side: 740 users at ~46 rows each is trivially memorised,
+  # 3256 items at ~10 rows each is not, and items are shared across users so the
+  # item token has to generalise. Dropping <UserID> is what moved stage 2's peak
+  # off step 100; keeping <TargetItemID> is what gives MF a direct gradient path
+  # for stage 3 (see the stage-3 header).
+  freeze_proj: False
   # LoRA must train here. It is the only module that can learn to *read*
   # <PrefTokens>; freezing it is what starved the Q-Former. Held at lr/10 via
   # `lr_scale.lora` so it drifts off the stage-1 solution slowly.
@@ -59,16 +60,17 @@ model:
   # The cost is that stage 1's LoRA has no familiar ground to stand on -- see the
   # LoRA lr note in `lr_scale` below, which is what pays for it.
   #
-  # `_prefonly` also drops <UserID>/<TargetItemID>, leaving <PrefTokens> as the
-  # ONLY collaborative channel -- which is what the method actually claims. The
-  # candidate still reaches the Q-Former through `query_gen(item_emb)` and stays
-  # in the prompt as <TargetItemTitle> text, so nothing is lost on the item side.
-  # Splicing is plan-driven (`soft_slot_plan` only emits flags present in the
-  # prompt), so dropping the two flags needs no code change.
+  # `_prefitem` drops <UserID> but keeps <TargetItemID>. That is the claim the
+  # paper actually makes -- preference tokens replace the USER id -- and it keeps
+  # the item-side path that T2-style MF tuning needs. Splicing is plan-driven
+  # (`soft_slot_plan` only emits flags present in the prompt), so dropping one
+  # flag needs no code change.
   #
-  # Controls: `qformer_movie.txt` = `+idtokens`, `qformer_movie_titles.txt` =
-  # `+titles` (debugging only).
-  prompt_path: "prompts/qformer_movie_prefonly.txt"
+  # Controls: `_prefonly` = `-itemid` (both ids dropped; best so far, uauc 0.6924
+  # / auc 0.6952, but stage-3 MF tuning did nothing through it),
+  # `qformer_movie.txt` = `+userid` (peaked at step 100 and memorised),
+  # `qformer_movie_titles.txt` = `+titles` (debugging only).
+  prompt_path: "prompts/qformer_movie_prefitem.txt"
   prompt_template: '{}'
   llama_model: /content/vicuna-7b-v0
   user_num: -100

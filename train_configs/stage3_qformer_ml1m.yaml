@@ -14,6 +14,14 @@
 # in the loss optimises it directly, and closing the gap to CoLLM-MF T2 (0.7418
 # test) is what unfreezing MF is for.
 #
+# Why the prompt keeps <TargetItemID>: with the `_prefonly` prompt this stage did
+# nothing at all -- 400 steps with MF at 1e-4 moved train loss_bce by 0.00 and
+# cost 0.033 uauc. MF only reached the LLM through the memory bank, i.e. through a
+# weighted average over 65 slots pooled into 4 tokens, so its gradient arrived
+# diluted to nothing. CoLLM's T2 gets +0.094 test AUC from MF tuning precisely
+# because <UserID>/<TargetItemID> feed MF into the LLM directly. Keeping the item
+# id restores that path on the side that does not memorise.
+#
 # PRECONDITION -- stage 3 inherits whatever stage 2 produced. The previous
 # collapse here was not independent: stage 2's `checkpoint_best.pth` was its
 # epoch 0, so stage 3 initialised from a Q-Former that had never trained. Check
@@ -29,7 +37,7 @@ model:
   # the same memorisation shape that <UserID> had. Stage 2 must be stable before
   # it opens. Expect `'rec': 1048320` in the `by group` line.
   freeze_rec: False
-  freeze_proj: True           # MUST match stage 2 -- no <UserID> in the prompt
+  freeze_proj: False          # MUST match stage 2 -- <TargetItemID> is spliced
   freeze_lora: False          # trains in stage 2 too, just slower here
   max_txt_len: 1024
   proj_token_num: 1
@@ -43,7 +51,7 @@ model:
   end_sym: "###"
   # MUST match stage 2 -- a prompt swap between stages is exactly the mismatch
   # that broke the stage-1 -> stage-2 hand-off.
-  prompt_path: "prompts/qformer_movie_prefonly.txt"
+  prompt_path: "prompts/qformer_movie_prefitem.txt"
   prompt_template: '{}'
   llama_model: /content/vicuna-7b-v0
   user_num: -100
