@@ -21,7 +21,7 @@ model:
   arch: mini_gpt4rec_qformer
   model_type: pretrain_vicuna
   freeze_rec: True            # False for the final runs (T2-style tuning)
-  freeze_proj: False          # the <UserID>/<TargetItemID> mapping trains here
+  freeze_proj: True           # MUST match stage 2 -- no <UserID> in the prompt
   freeze_lora: False          # trains in stage 2 too, just slower here
   max_txt_len: 1024
   proj_token_num: 1
@@ -35,7 +35,7 @@ model:
   end_sym: "###"
   # MUST match stage 2 -- a prompt swap between stages is exactly the mismatch
   # that broke the stage-1 -> stage-2 hand-off.
-  prompt_path: "prompts/qformer_movie.txt"
+  prompt_path: "prompts/qformer_movie_prefonly.txt"
   prompt_template: '{}'
   llama_model: /content/vicuna-7b-v0
   user_num: -100

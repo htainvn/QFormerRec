@@ -33,7 +33,12 @@ model:
   arch: mini_gpt4rec_qformer
   model_type: pretrain_vicuna
   freeze_rec: True            # False for the final runs (T2-style tuning)
-  freeze_proj: False          # the <UserID>/<TargetItemID> mapping trains here
+  # <UserID> is a direct memorisation channel: llama_proj is 2.23M params serving
+  # only 740 ML-1M users (~3k params/user, ~46 labelled rows each), so "user X
+  # usually says Yes" is trivially learnable and does not transfer to the OOD
+  # split. With the prompt below there is no <UserID>/<TargetItemID> to splice,
+  # so llama_proj is unused -- freezing it drops those 2.23M from the optimizer.
+  freeze_proj: True
   # LoRA must train here. It is the only module that can learn to *read*
   # <PrefTokens>; freezing it is what starved the Q-Former. Held at lr/10 via
   # `lr_scale.lora` so it drifts off the stage-1 solution slowly.
@@ -53,8 +58,17 @@ model:
   # afford to render. Keeping <ItemTitleList> here would undo the contribution.
   # The cost is that stage 1's LoRA has no familiar ground to stand on -- see the
   # LoRA lr note in `lr_scale` below, which is what pays for it.
-  # `qformer_movie_titles.txt` is the `+titles` control, for debugging only.
-  prompt_path: "prompts/qformer_movie.txt"
+  #
+  # `_prefonly` also drops <UserID>/<TargetItemID>, leaving <PrefTokens> as the
+  # ONLY collaborative channel -- which is what the method actually claims. The
+  # candidate still reaches the Q-Former through `query_gen(item_emb)` and stays
+  # in the prompt as <TargetItemTitle> text, so nothing is lost on the item side.
+  # Splicing is plan-driven (`soft_slot_plan` only emits flags present in the
+  # prompt), so dropping the two flags needs no code change.
+  #
+  # Controls: `qformer_movie.txt` = `+idtokens`, `qformer_movie_titles.txt` =
+  # `+titles` (debugging only).
+  prompt_path: "prompts/qformer_movie_prefonly.txt"
   prompt_template: '{}'
   llama_model: /content/vicuna-7b-v0
   user_num: -100
@@ -151,12 +165,10 @@ run:
 
   lr_scale:                   # effective lr = init_lr * scale
     qformer: 1.0              # 5e-5
-    # llama_proj is the shortcut that memorised the frozen MF embeddings and drove
-    # train BCE to 0.14 while validation degraded. It cannot be frozen -- stage 1
-    # never trained it (`freeze_proj: True` there), so freezing would leave
-    # <UserID>/<TargetItemID> as random vectors -- but it must not outrun the
-    # Q-Former either.
-    proj: 0.1                 # 5e-6
+    # Kept only so the `+idtokens` control (prompt_path=qformer_movie.txt,
+    # freeze_proj=False) reuses this file unchanged. With the prefonly prompt the
+    # `proj` group is empty and this value has no effect.
+    proj: 0.1
     proto: 1.0                # 5e-5
     rec: 0.1                  # 5e-6  (only matters if freeze_rec: False)
     # Scale > 1 is fine -- the scheduler just multiplies. LoRA is NOT being
