@@ -156,6 +156,13 @@ class _QFormerBuilder(RecBaseDatasetBuilder):
 
         # width of the emitted point-in-time history; must be >= the model's k_hist
         width = int(self.config.get("pit_hist_width", 50))
+        # Which file backs the "valid" split. CoLLM uses valid_small (5 200 rows) for
+        # speed, but UAUC is a mean over per-user AUCs and most of those users have very
+        # few rows, so it is a noisy selection signal: SE 0.0168 on valid_small vs 0.0122
+        # on the full valid (10 401 rows, 282 scoreable users instead of 239). Since
+        # nothing is *reported* on validation, the larger split is strictly better for
+        # picking checkpoints -- it only costs eval time.
+        valid_split = str(self.config.get("valid_split", "valid_small"))
         cls = self.train_dataset_cls
         tp = self.text_processors["train"]
 
@@ -163,7 +170,7 @@ class _QFormerBuilder(RecBaseDatasetBuilder):
             return cls(text_processor=tp, ann_paths=[os.path.join(storage_path, name)],
                        pit_hist_width=width)
 
-        datasets = {"train": _ds("train"), "valid": _ds("valid_small"), "test": _ds("test")}
+        datasets = {"train": _ds("train"), "valid": _ds(valid_split), "test": _ds("test")}
         if evaluate_only:
             datasets["test_warm"] = _ds("test=warm")
             datasets["test_cold"] = _ds("test=cold")

@@ -88,6 +88,9 @@ datasets:
     path: /content/data/book/
     data_type: default
     pit_hist_width: 50          # width of the emitted history; must be >= k_hist
+    # full valid (10 401 rows) instead of CoLLM's valid_small (5 200): UAUC selection
+    # noise drops from SE 0.0168 to 0.0122. Costs ~2x eval time, reports nothing.
+    valid_split: valid
     build_info:
       storage: /content/data/book/
 

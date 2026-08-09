@@ -1,17 +1,28 @@
 # ---------------------------------------------------------------------------
-# Stage 3 -- joint tuning: everything from stage 2 PLUS LoRA at lr/10.
+# Stage 3 -- low-lr joint anneal on top of stage 2.
 #
 # Mirrors CoLLM's T1/T2 tuning, which is where its best numbers came from -- do
 # not skip it. Start from the stage-2 best checkpoint (`ckpt`) AND the stage-1
 # LoRA weights (`ckpt_lora`), since the stage-2 checkpoint only stores the
 # parameters that were trainable in stage 2.
+#
+# NOTE -- stage 3 is now an anneal, not an unfreeze. LoRA already trains in
+# stage 2 (freezing it there is what starved the Q-Former; see the stage-2
+# header). What still distinguishes this stage is the 10x lower lr, and
+# `freeze_rec: False` if you want CoLLM's T2-style MF tuning.
+#
+# PRECONDITION -- stage 3 inherits whatever stage 2 produced. The previous
+# collapse here was not independent: stage 2's `checkpoint_best.pth` was its
+# epoch 0, so stage 3 initialised from a Q-Former that had never trained. Check
+# that stage 2's best epoch is NOT epoch 0 and that its valid auc beat the
+# stage-1 baseline (~0.687 on ML-1M) before spending a run here.
 # ---------------------------------------------------------------------------
 model:
   arch: mini_gpt4rec_qformer
   model_type: pretrain_vicuna
   freeze_rec: True            # False for the final runs (T2-style tuning)
   freeze_proj: False          # the <UserID>/<TargetItemID> mapping trains here
-  freeze_lora: False          # <-- stage 3 unfreezes LoRA
+  freeze_lora: False          # trains in stage 2 too, just slower here
   max_txt_len: 1024
   proj_token_num: 1
   proj_drop: 0
@@ -22,6 +33,8 @@ model:
   # MUST match between stage 2 and stage 3, or the stage-2 checkpoint will not load.
   proj_mid_times: 2
   end_sym: "###"
+  # MUST match stage 2 -- a prompt swap between stages is exactly the mismatch
+  # that broke the stage-1 -> stage-2 hand-off.
   prompt_path: "prompts/qformer_movie.txt"
   prompt_template: '{}'
   llama_model: /content/vicuna-7b-v0
@@ -29,7 +42,7 @@ model:
   item_num: -100
   ans_type: 'v2'
   rec_model: "MF"
-  n_titles_kept: 0            # set to 3 for the `+titles` fallback/ablation
+  n_titles_kept: 0            # MUST match stage 2
   diag_log_freq: 200          # steps between anti-collapse diagnostic dumps
 
   ckpt_lora: /content/logs/stage1_ml1m/checkpoint_best.pth   # cached stage 1
@@ -84,6 +97,9 @@ datasets:
     path: /content/data/ml-1m/
     data_type: default
     pit_hist_width: 50          # width of the emitted history; must be >= k_hist
+    # full valid (10 401 rows) instead of CoLLM's valid_small (5 200): UAUC selection
+    # noise drops from SE 0.0168 to 0.0122. Costs ~2x eval time, reports nothing.
+    valid_split: valid
     build_info:
       storage: /content/data/ml-1m/
 
@@ -91,9 +107,9 @@ run:
   task: rec_qformer
   runner: rec_runner_qformer
   lr_sched: "linear_warmup_cosine_lr_scaled"
-  init_lr: 1e-4               # stage 3 = stage-2 lrs / 10
-  min_lr: 1e-5
-  warmup_lr: 1e-5
+  init_lr: 5e-6               # stage 3 = stage-2 lrs / 10
+  min_lr: 5e-7
+  warmup_lr: 1e-6
   mode: 'v2'
   select_metric: uauc
   # early stop after this many validations without a select_metric improvement.
@@ -107,11 +123,11 @@ run:
   fp32_trainable: True
 
   lr_scale:                   # effective lr = init_lr * scale
-    qformer: 1.0
-    proj: 1.0                 # <UserID>/<TargetItemID> MLP; try 0.3 if it destabilises
-    proto: 1.0
-    rec: 0.1                  # 1e-5
-    lora: 0.1                 # 1e-5
+    qformer: 1.0              # 5e-6
+    proj: 0.1                 # 5e-7  -- same shortcut throttle as stage 2
+    proto: 1.0                # 5e-6
+    rec: 0.1                  # 5e-7
+    lora: 2.0                 # 1e-5  -- keeps stage 2's ratio at stage 3's lr/10
 
   user_grouped_sampler: True  # required by L_rank; False ablates it cleanly
   users_per_batch: 8          # U
