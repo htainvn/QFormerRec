@@ -114,6 +114,7 @@ class MemoryEncoder(nn.Module):
         dropout=0.1,
         use_slot_prior=True,
         history_source="pit",
+        use_title=False,
     ):
         super().__init__()
         assert history_source in ("pit", "train_only"), history_source
@@ -184,6 +185,60 @@ class MemoryEncoder(nn.Module):
         self.rank_emb = nn.Embedding(max(self.k_hist, 1), d_q)
         nn.init.normal_(self.type_emb.weight, std=0.02)
         nn.init.normal_(self.rank_emb.weight, std=0.02)
+
+        # ---- title semantics on the history slots (optional second source)
+        #
+        # KEEP THIS BLOCK LAST. It draws from the RNG (`unk_title`, `title_proj`),
+        # so constructing it earlier would shift every module built after it and
+        # `use_title=True/False` at one seed would differ in far more than the
+        # title path -- which is exactly what the `-title` ablation must isolate.
+        #
+        # Every other slot -- user, history, neighbours, genre and cluster
+        # prototypes -- is a function of the same frozen MF table, so attention
+        # over them is a convex combination inside one span and cannot beat the
+        # point MF already fitted for that user. Measured: a 65-slot memory scored
+        # the same as the 1-slot user-only ablation. `title_emb` is the one input
+        # from outside that span, which is also why it covers cold items: an
+        # unseen item has an untrained MF row but a readable title.
+        #
+        # A separate projection summed in, rather than concatenating into `proj`:
+        # algebraically identical (a linear map on a concatenation is the sum of
+        # two linear maps) but it leaves the shared `proj` path untouched for the
+        # slot types that have no title, and `use_title=False` restores the old
+        # artifact exactly.
+        self.use_title = bool(use_title) and self.k_hist > 0
+        if self.use_title:
+            assert "title_emb" in memory_index, (
+                "use_title=True but this memory index has no `title_emb` -- rebuild it "
+                "with scripts/build_memory.py --llm_path <vicuna dir>"
+            )
+            # fp32 to match the rest of this block, which runs with autocast
+            # disabled. Resident cost is (n_items x d_text x 4): ~53 MB on ML-1M,
+            # ~560 MB on Amazon-Book. Non-persistent, so it never enters a
+            # checkpoint -- it is rebuilt from the artifact on every load.
+            t_init = torch.as_tensor(np.asarray(memory_index["title_emb"]), dtype=torch.float)
+            self.d_text = t_init.shape[1]
+            assert t_init.shape[0] == self.item_in_train.shape[0], (
+                f"title_emb covers {t_init.shape[0]} items but the artifact's item tables "
+                f"have {self.item_in_train.shape[0]} -- mismatched memory index"
+            )
+            self.register_buffer("title_emb", t_init, persistent=False)
+            _buf("title_covered", memory_index["title_covered"], torch.bool)
+            # mirrors `unk_item`: a learned stand-in for ids with no title at all
+            self.unk_title = nn.Parameter(torch.randn(self.d_text) * 0.02)
+            self.title_proj = nn.Linear(self.d_text, d_q, bias=False)
+            # Standardising `title_emb` to unit row-norm equalises the two INPUTS,
+            # but not the two projections: nn.Linear inits at 1/sqrt(fan_in), and
+            # fan_in differs 16x (d_text 4096 vs d1 256), so for unit-norm inputs
+            # ||W_title x|| = sqrt(d_q/3d_text) = 0.102 against ||W_mf x|| =
+            # sqrt(d_q/3d1) = 0.408 -- the title branch would start 4x quieter and
+            # sit under the MF branch through the LayerNorm that follows. Rescale
+            # so both sources contribute equally at step 0 and the model is free to
+            # reweight them from there.
+            with torch.no_grad():
+                self.title_proj.weight.mul_((self.d_text / d1) ** 0.5)
+        else:
+            self.d_text = 0
         self.ln = nn.LayerNorm(d_q)
         self.drop = nn.Dropout(dropout)
 
@@ -215,6 +270,7 @@ class MemoryEncoder(nn.Module):
         priors.append(torch.ones(B, 1, device=uid.device))
 
         # --- history items: the sample's own point-in-time history
+        hist_safe = hist_mask = None          # kept for the title lookup below
         if self.k_hist > 0:
             if self.history_source == "pit":
                 assert pit_hist is not None, (
@@ -238,6 +294,7 @@ class MemoryEncoder(nn.Module):
                             item_emb_fn(safe))
             vecs.append(e)
             masks.append(m)
+            hist_safe, hist_mask = safe, m
             rank = torch.arange(self.k_hist, device=uid.device, dtype=torch.float)
             priors.append((1.0 / (rank + 1.0)).unsqueeze(0).expand(B, -1))
             type_ids[:, 1 : 1 + self.k_hist] = torch.where(
@@ -278,6 +335,20 @@ class MemoryEncoder(nn.Module):
 
         raw = raw * mask.unsqueeze(-1)                     # zero out padded rows
         mem = self.proj(raw) + self.type_emb(type_ids)      # type_ids is (B, N)
+
+        # title semantics, added only on the history block. Same out-of-place shape
+        # trick as the recency embedding below: build a (B, N, d_q) tensor that is
+        # zero everywhere except slots [1 : 1+k_hist].
+        if self.use_title and hist_safe is not None:
+            t = self.title_emb[hist_safe]                              # (B, k_hist, d_text)
+            t = torch.where(self.title_covered[hist_safe].unsqueeze(-1),
+                            t, self.unk_title.view(1, 1, -1))
+            t = self.title_proj(t * hist_mask.unsqueeze(-1))           # (B, k_hist, d_q)
+            parts = [mem.new_zeros(B, 1, self.d_q), t]
+            n_tail = self.n_slots - 1 - self.k_hist
+            if n_tail > 0:
+                parts.append(mem.new_zeros(B, n_tail, self.d_q))
+            mem = mem + torch.cat(parts, dim=1)
         if self.k_hist > 0:
             # recency embedding on the history slots only, added out-of-place
             rank_ids = torch.arange(self.k_hist, device=uid.device)

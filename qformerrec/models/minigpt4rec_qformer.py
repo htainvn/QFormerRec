@@ -121,6 +121,7 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             k_cluster=mem_cfg.get("k_cluster", 3),
             dropout=float(qf.get("dropout", 0.1)),
             use_slot_prior=bool(qf.get("use_slot_prior", True)),
+            use_title=bool(mem_cfg.get("use_title", False)),
         )
         self.query_gen = CandidateAwareQueryGenerator(
             d1=d1, d_q=d_q, n_query=self.n_query,
@@ -144,7 +145,9 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
         print(
             f"[qformer] d_q={d_q} L={self.n_query} slots={self.memory_encoder.n_slots} "
             f"layers={len(self.qformer.layers)} llm_emb_norm={self.llm_emb_norm_mean:.4f} "
-            f"target_rms={self.llm_emb_rms:.6f} match_llm_norm={self.match_llm_norm}"
+            f"target_rms={self.llm_emb_rms:.6f} match_llm_norm={self.match_llm_norm} "
+            f"use_title={self.memory_encoder.use_title}"
+            + (f" d_text={self.memory_encoder.d_text}" if self.memory_encoder.use_title else "")
         )
 
         self.cf_head = CFAuxHead(d_q)

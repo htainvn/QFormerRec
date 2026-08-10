@@ -30,6 +30,18 @@ Contents of the artifact:
   user_has_train     (U,)            bool: has >=1 train positive
   genre_proto_init   (G, d1)         mean MF item embedding per genre
   cluster_proto_init (K, d1)         KMeans centroids of MF user embeddings
+  title_emb          (I, d_text)     OPTIONAL (--llm_path). Per-item title semantics:
+                                     the LLM's hidden state at `--title_layer`, taken
+                                     at the LAST token of a short template. Every
+                                     other structure here is a function of the frozen
+                                     MF table, so attention over them cannot leave the
+                                     span MF already optimised -- measured: a 65-slot
+                                     memory scored the same as the 1-slot user-only
+                                     ablation. This table is the one input that is
+                                     independent of MF, which is also why it survives
+                                     cold items: an unseen item has an untrained MF row
+                                     but a perfectly readable title.
+  title_covered      (I,)            bool: did we find a title for this id?
   meta               dict
 """
 
@@ -220,6 +232,98 @@ def build_user_clusters(user_emb, n_users, n_clusters, k_cluster, seed):
 
 
 # --------------------------------------------------------------------------- #
+def build_title_embeddings(iid2title, n_items, llm_path, layer, template,
+                           batch_size=64, device=None, max_len=48):
+    """(I, d_text) float16 title semantics, plus a coverage mask.
+
+    Decisions that matter, and why:
+
+    * **Last token, not mean.** The LLM is decoder-only, so causal attention means
+      only the final position has seen the whole title. Mean-pooling mixes in
+      positions that saw a prefix, and the tokenizer shreds titles into pieces
+      ("Sh", "aws", "hank") whose individual embeddings are close to noise.
+    * **A mid-to-late layer, not the last.** The final layer is specialised for
+      next-token prediction; layers around 2/3 depth carry more of the semantics
+      we want. Exposed as `--title_layer` so it can be ablated.
+    * **A template, not the bare title.** A noun phrase with no context gives a
+      thin hidden state; `The movie titled "X"` gives the model something to
+      condition on. Also ablatable.
+    * **Standardised here, not at train time.** Llama hidden states carry a few
+      outlier dimensions with very large magnitude, and their norm grows with
+      depth, while MF rows are O(1). Summed untouched, the title branch would
+      swamp the MF branch and the comparison would be meaningless. Per-dimension
+      standardisation followed by a rescale to unit mean row-norm makes the two
+      sources land on the same scale, once, inside the artifact.
+    """
+    import torch as _torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = device or ("cuda" if _torch.cuda.is_available() else "cpu")
+    tok = AutoTokenizer.from_pretrained(llm_path, use_fast=False)
+    if tok.pad_token is None:
+        tok.pad_token = tok.unk_token or tok.eos_token
+    # NOT optional. Llama tokenizers are commonly configured left-padded, and this
+    # repo flips `padding_side` on the tokenizer at several points. The extraction
+    # below indexes the last real token as `attention_mask.sum(-1) - 1`, which is
+    # only correct for right padding -- under left padding it would read a PAD
+    # position for every shorter title and silently return noise.
+    tok.padding_side = "right"
+    model = AutoModelForCausalLM.from_pretrained(
+        llm_path, torch_dtype=_torch.float16 if device == "cuda" else _torch.float32
+    ).to(device).eval()
+
+    n_layers = model.config.num_hidden_layers
+    assert 0 < layer <= n_layers, f"--title_layer must be in 1..{n_layers}, got {layer}"
+    d_text = model.config.hidden_size
+
+    ids = sorted(iid2title)
+    covered = np.zeros(n_items, dtype=bool)
+    out = np.zeros((n_items, d_text), dtype=np.float32)
+
+    with _torch.no_grad():
+        for s in range(0, len(ids), batch_size):
+            chunk = ids[s:s + batch_size]
+            texts = [template.format(title=str(iid2title[i]).strip()) for i in chunk]
+            enc = tok(texts, return_tensors="pt", padding=True, truncation=True,
+                      max_length=max_len).to(device)
+            hs = model(**enc, output_hidden_states=True).hidden_states[layer]
+            # right padding (forced above): the last real token is at (length - 1)
+            last = enc["attention_mask"].sum(-1) - 1
+            assert bool((enc["attention_mask"][:, 0] == 1).all()), (
+                "left padding detected -- the last-token index below would read a PAD "
+                "position; tok.padding_side was set to 'right' but did not take"
+            )
+            vec = hs[_torch.arange(hs.shape[0], device=device), last]
+            out[chunk] = vec.float().cpu().numpy()
+            covered[chunk] = True
+            if s % (batch_size * 20) == 0:
+                print(f"[title] {s + len(chunk)}/{len(ids)}", flush=True)
+
+    del model
+    if device == "cuda":
+        _torch.cuda.empty_cache()
+
+    # standardise over covered rows only -- uncovered rows are all-zero and would
+    # drag the mean toward zero and inflate the std
+    obs = out[covered]
+    mu, sd = obs.mean(axis=0), obs.std(axis=0) + 1e-6
+    out[covered] = (obs - mu) / sd
+    scale = np.linalg.norm(out[covered], axis=1).mean()
+    out[covered] /= max(float(scale), 1e-6)
+
+    print(f"[title] layer={layer}/{n_layers} d_text={d_text} "
+          f"covered={covered.sum()}/{n_items} ({covered.mean():.2%}) "
+          f"mean_row_norm={np.linalg.norm(out[covered], axis=1).mean():.4f}")
+    if covered.mean() < 0.9:
+        # not fatal on its own: titles are harvested from the target column, so an
+        # id that only ever appears inside someone's history is missed and falls
+        # back to the learned `unk_title`. What actually matters is the cold split,
+        # asserted by the caller once `item_in_train` is known.
+        print(f"[title] WARNING: {1 - covered.mean():.1%} of item ids have no title and "
+              "will use the learned `unk_title` vector")
+    return out.astype(np.float16), covered
+
+
 def main():
     ap = argparse.ArgumentParser(description="build the collaborative memory index")
     ap.add_argument("--data_dir", required=True, help="dir with {train,valid,test}_ood2.pkl")
@@ -237,11 +341,20 @@ def main():
     ap.add_argument("--n_item_clusters", type=int, default=32,
                     help="pseudo-genre count when genre_source=item_kmeans")
     ap.add_argument("--seed", type=int, default=42)
+    # ---- optional title-semantics table (the one non-MF input; see the header)
+    ap.add_argument("--llm_path", default=None,
+                    help="build `title_emb` with this LLM (e.g. /content/vicuna-7b-v0). "
+                         "Omit to produce the MF-only artifact exactly as before.")
+    ap.add_argument("--title_layer", type=int, default=20,
+                    help="hidden layer to read (1..n_layers); ~2/3 depth beats the last")
+    ap.add_argument("--title_template", default='The movie titled "{title}"',
+                    help="context around the raw title; use '{title}' for the bare form")
+    ap.add_argument("--title_batch_size", type=int, default=64)
     args = ap.parse_args()
 
-    train, valid, test, paths = load_splits(
-        args.data_dir, need_titles=(args.genre_source == "metadata")
-    )
+    # titles are needed for the genre map, for the title table, or both
+    need_titles = (args.genre_source == "metadata") or bool(args.llm_path)
+    train, valid, test, paths = load_splits(args.data_dir, need_titles=need_titles)
 
     # id space must match MF's tables, which were sized over all splits
     n_users = int(max(train.uid.max(), valid.uid.max(), test.uid.max())) + 1
@@ -272,6 +385,18 @@ def main():
     R.data[:] = 1.0  # binary, in case of duplicate (u, i) rows
     neighbors, neighbor_sim = build_neighbors(R, n_users, args.k_neighbor)
 
+    # ---- item titles: metadata, not interactions, so all splits are fair game.
+    # Built unconditionally (when available) rather than inside the metadata-genre
+    # branch below: Amazon-Book takes the item_kmeans path, and leaving this
+    # inside would silently produce a title-less artifact for that dataset.
+    iid2title = {}
+    if need_titles:
+        for df in (train, valid, test):
+            for iid, t in zip(df.iid.values, df.title.values):
+                if isinstance(t, str) and t.strip():
+                    iid2title.setdefault(int(iid), t)
+        print(f"[title] ids with a title: {len(iid2title)}/{n_items}")
+
     # ---- genres / categories
     if args.genre_source == "metadata":
         assert args.dataset == "ml1m", (
@@ -281,11 +406,6 @@ def main():
         assert args.movies_dat and os.path.exists(args.movies_dat), (
             "--movies_dat is required for genre_source=metadata"
         )
-        # item titles are metadata, not interactions: safe to read from all splits
-        iid2title = {}
-        for df in (train, valid, test):
-            for iid, t in zip(df.iid.values, df.title.values):
-                iid2title.setdefault(int(iid), t)
         item_g, n_genres = item_genres_from_movies_dat(args.movies_dat, iid2title, n_items)
     else:
         item_g, n_genres = item_genres_from_kmeans(
@@ -319,6 +439,27 @@ def main():
     print(f"[items] seen in train: {item_in_train.sum()}/{n_items} "
           f"({item_in_train.mean():.2%})")
 
+    # ---- title semantics (optional)
+    title_emb, title_covered = None, None
+    if args.llm_path:
+        assert iid2title, "--llm_path needs item titles, but none were found in the pickles"
+        title_emb, title_covered = build_title_embeddings(
+            iid2title, n_items, args.llm_path, args.title_layer,
+            args.title_template, args.title_batch_size,
+        )
+        cold_cov = title_covered[~item_in_train]
+        rate = float(cold_cov.mean()) if len(cold_cov) else 1.0
+        print(f"[title] cold items with a title: {cold_cov.sum()}/{len(cold_cov)} "
+              f"({rate:.2%})  <- the point of this table")
+        # Cold items are the case the table exists for: their MF row was never
+        # trained, so the title is the only signal they have. A thin cold table
+        # would quietly turn the experiment into a no-op on exactly the split
+        # where the effect is expected.
+        assert rate > 0.8, (
+            f"only {rate:.1%} of cold items have a title -- the cold split is where this "
+            "table is supposed to pay off, so this would test nothing"
+        )
+
     meta = {
         "dataset": args.dataset,
         "n_users": n_users,
@@ -340,6 +481,12 @@ def main():
         "valid_ts_min": int(valid.timestamp.min()),
         "n_items_in_train": int(item_in_train.sum()),
         "hist_items_is_ablation_only": True,
+        "has_title_emb": title_emb is not None,
+        "title_llm": os.path.abspath(args.llm_path) if args.llm_path else None,
+        "title_layer": args.title_layer if title_emb is not None else None,
+        "title_template": args.title_template if title_emb is not None else None,
+        "title_dim": int(title_emb.shape[1]) if title_emb is not None else None,
+        "title_covered": int(title_covered.sum()) if title_emb is not None else None,
     }
 
     out = {
@@ -354,6 +501,9 @@ def main():
         "cluster_proto_init": cluster_proto,
         "meta": meta,
     }
+    if title_emb is not None:
+        out["title_emb"] = title_emb
+        out["title_covered"] = title_covered
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "wb") as f:
         pickle.dump(out, f, protocol=4)

@@ -117,6 +117,9 @@ model:
       k_neighbor: 8
       k_genre: 3
       k_cluster: 3
+      # Title semantics on the history slots. False reproduces every run before
+      # 2026-08-11 exactly. Needs a memory index built with --llm_path.
+      use_title: False
       memory_index_path: /content/ckpt/memory_index_ml1m.pkl
   loss:
     lambda_rank: 0.5
