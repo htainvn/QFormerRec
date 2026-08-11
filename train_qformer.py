@@ -82,6 +82,25 @@ def get_runner_class(cfg):
     return registry.get_runner_class(cfg.run_cfg.get("runner", "rec_runner_qformer"))
 
 
+def allow_path_globals():
+    """Let `torch.load` read checkpoints that contain a pathlib.Path.
+
+    torch >= 2.6 defaults `weights_only=True`, which refuses any class not on the
+    allowlist. An earlier version of the provenance field stored `output_dir` as a
+    Path, so those checkpoints save fine and then fail to load with
+    `Unsupported global: GLOBAL pathlib.PosixPath`. The writer now stores a string,
+    but the checkpoints already on disk still carry the Path.
+
+    Allowlisting the two Path classes is far narrower than `weights_only=False`:
+    it permits exactly these, and nothing else gains the ability to execute.
+    """
+    add = getattr(torch.serialization, "add_safe_globals", None)
+    if add is None:
+        return                      # torch < 2.4: weights_only is not the default
+    import pathlib
+    add([pathlib.PosixPath, pathlib.WindowsPath, pathlib.PurePosixPath])
+
+
 def report_checkpoint_provenance(cfg):
     """Say which run and which epoch every checkpoint this job loads came from.
 
@@ -129,6 +148,7 @@ def main():
     # strict: refuse to start on a known-bad stack rather than train for hours and
     # report loss=nan (which is exactly what transformers 5.x does here).
     check_environment(strict=os.environ.get("QFORMERREC_ALLOW_BAD_ENV") != "1")
+    allow_path_globals()          # before any torch.load, i.e. before build_model
     job_id = now()
     cfg = Config(parse_args())
     init_distributed_mode(cfg.run_cfg)

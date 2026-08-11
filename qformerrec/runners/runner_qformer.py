@@ -247,10 +247,16 @@ class RecRunnerQFormer(RecRunnerBase):
             # indistinguishable from a good one by size, name or mtime. Measured:
             # exactly that file was cached as the stage-1 LoRA and used as
             # `ckpt_lora` by every stage-2/3 run for two days.
+            # primitives ONLY. `self.output_dir` is a pathlib.Path, and torch >= 2.6
+            # defaults `weights_only=True`, which refuses to unpickle any non-allowlisted
+            # class -- so storing the Path here saved fine and then made the checkpoint
+            # unloadable, which is the worst possible failure shape for a provenance
+            # field whose entire purpose is to survive.
             "provenance": {
-                "output_dir": self.output_dir,
+                "output_dir": str(self.output_dir),
                 "is_best": bool(is_best),
-                **(provenance or {}),
+                **{k: (str(v) if isinstance(v, os.PathLike) else v)
+                   for k, v in (provenance or {}).items()},
             },
         }
         save_to = os.path.join(
