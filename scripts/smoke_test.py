@@ -444,11 +444,22 @@ def test_controls():
         y = ablate_content(x, mode)
         check(f"ablate_content[{mode}]: shape kept", y.shape == x.shape)
         check(f"ablate_content[{mode}]: content changed", not torch.allclose(y, x))
-    rms_x = x.pow(2).mean(-1).sqrt()
-    rms_r = ablate_content(x, "random").pow(2).mean(-1).sqrt()
-    check("ablate_content[random]: per-row RMS preserved",
-          torch.allclose(rms_x, rms_r, rtol=0.35), f"max rel err "
-          f"{float(((rms_r - rms_x).abs() / rms_x).max()):.3f}")
+    # RMS must be preserved EXACTLY, not on average: at d_q=16 the sample RMS of
+    # randn deviates by ~18%, so a loose tolerance here would pass an implementation
+    # whose per-row scale drifts -- and that drift is the confound the control exists
+    # to remove. Checked at a narrow and a wide width, since the two differ by ~18x
+    # in how visible a non-normalised implementation would be.
+    for d in (16, 4096):
+        xd = torch.randn(B, L, d) * 3.0
+        rms_x = xd.pow(2).mean(-1).sqrt()
+        rms_r = ablate_content(xd, "random").pow(2).mean(-1).sqrt()
+        check(f"ablate_content[random]: per-row RMS preserved exactly (d={d})",
+              torch.allclose(rms_x, rms_r, rtol=1e-5, atol=1e-6),
+              f"max rel err {float(((rms_r - rms_x).abs() / rms_x).max()):.2e}")
+    zrow = torch.randn(B, L, 32)
+    zrow[:, 0] = 0.0                       # a padded slot: must stay exactly zero
+    check("ablate_content[random]: all-zero rows stay zero",
+          float(ablate_content(zrow, "random")[:, 0].abs().max()) == 0.0)
     perm_y = ablate_content(x, "shuffle", perm=torch.arange(B))
     check("ablate_content[shuffle]: identity perm is a no-op", torch.equal(perm_y, x))
     check("ablate_content[mean]: every row identical",

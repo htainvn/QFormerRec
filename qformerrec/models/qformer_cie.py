@@ -83,12 +83,18 @@ def split_title_list(titles_str):
     return titles_str.split('", "')
 
 
-def ablate_content(x, mode, perm=None):
+def ablate_content(x, mode, perm=None, eps=1e-12):
     """Return ``x`` with its information destroyed but its shape/scale kept.
 
-    ``random``  -- keep each row's RMS, randomise its direction. The scale is
-                   detached and the noise carries no grad, so a *training* run in
-                   this mode really trains with no information from ``x``.
+    ``random``  -- keep each row's RMS *exactly*, randomise its direction. The
+                   scale is detached and the noise carries no grad, so a *training*
+                   run in this mode really trains with no information from ``x``.
+                   The noise is renormalised to unit RMS before rescaling, rather
+                   than relying on ``randn`` being unit-RMS on average: the sample
+                   RMS of ``d`` standard normals deviates by ~``1/sqrt(2d)``, which
+                   is ~1% at d_llm=4096 but ~18% at d_q=16. A control whose scale
+                   drifts confounds "this content is useless" with "this tensor is
+                   the wrong size", which is the one thing it must not do.
     ``shuffle`` -- permute along the batch axis. The strongest of the three: the
                    marginal distribution of vectors is exactly the real one, only
                    the pairing with the row is broken. Use this when the worry is
@@ -105,7 +111,10 @@ def ablate_content(x, mode, perm=None):
         return x
     if mode == "random":
         rms = x.detach().pow(2).mean(dim=-1, keepdim=True).sqrt()
-        return torch.randn_like(x) * rms
+        z = torch.randn_like(x)
+        # an all-zero row (a padded slot) has rms 0 and stays zero either way
+        z = z / z.pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(eps)
+        return z * rms
     if mode == "shuffle":
         if perm is None:
             perm = torch.randperm(x.shape[0], device=x.device)
