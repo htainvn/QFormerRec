@@ -160,7 +160,10 @@ class RecRunnerQFormer(RecRunnerBase):
                         improved = agg_metrics > best_agg_metric and split_name == "valid"
                         if improved:
                             best_epoch, best_agg_metric = cur_epoch, agg_metrics
-                            self._save_checkpoint(cur_epoch, is_best=True)
+                            self._save_checkpoint(
+                                cur_epoch, is_best=True,
+                                provenance={"select_metric": metric, "value": float(agg_metrics)},
+                            )
                             not_change = 0
                         val_log.update({"best_epoch": best_epoch})
                         self.log_stats(val_log, split_name)
@@ -200,7 +203,7 @@ class RecRunnerQFormer(RecRunnerBase):
         self.set_model_mode(None)
 
     @main_process
-    def _save_checkpoint(self, cur_epoch, is_best=False):
+    def _save_checkpoint(self, cur_epoch, is_best=False, provenance=None):
         """Save only the trainable tensors -- filtered by identity, not by name.
 
         CoLLM's version drops frozen weights by key name::
@@ -237,6 +240,18 @@ class RecRunnerQFormer(RecRunnerBase):
             "config": self.config.to_dict(),
             "scaler": self.scaler.state_dict() if self.scaler else None,
             "epoch": cur_epoch,
+            # Make the file self-describing. A checkpoint that gets copied to a
+            # shared `ckpt/` dir loses its output_dir, its train.log and therefore
+            # every trace of which run produced it -- and a `checkpoint_best.pth`
+            # whose best epoch is 0 (a run killed after its first validation) is
+            # indistinguishable from a good one by size, name or mtime. Measured:
+            # exactly that file was cached as the stage-1 LoRA and used as
+            # `ckpt_lora` by every stage-2/3 run for two days.
+            "provenance": {
+                "output_dir": self.output_dir,
+                "is_best": bool(is_best),
+                **(provenance or {}),
+            },
         }
         save_to = os.path.join(
             self.output_dir, "checkpoint_{}.pth".format("best" if is_best else cur_epoch)

@@ -82,6 +82,49 @@ def get_runner_class(cfg):
     return registry.get_runner_class(cfg.run_cfg.get("runner", "rec_runner_qformer"))
 
 
+def report_checkpoint_provenance(cfg):
+    """Say which run and which epoch every checkpoint this job loads came from.
+
+    Lives here, not in the model, because the legacy `mini_gpt4rec_v2` arch loads
+    through CoLLM's own `from_config` and this repo does not modify the CoLLM tree
+    -- so a check inside `MiniGPT4RecQFormer.from_config` covers the Q-Former runs
+    and misses exactly the control that reads a cached stage-1 LoRA.
+
+    The failure this exists for: `checkpoint_best.pth` is epoch 0 whenever a run is
+    killed after its first validation, and once that file is copied into a shared
+    `ckpt/` dir it has no output_dir, no train.log and no way to tell it from a
+    good one -- same name, same size, same tensor list. Measured: such a file was
+    cached as the stage-1 LoRA and silently initialised every stage-2/3 run for two
+    days, and read out as "text prompting is at chance" when it was "this LoRA saw
+    3 200 samples". The epoch was inside the file the whole time.
+    """
+    for key in ("ckpt_lora", "ckpt"):
+        path = cfg.model_cfg.get(key, None)
+        if not path or not os.path.exists(str(path)):
+            continue          # absent or missing: the model's loader reports it
+        try:
+            blob = torch.load(str(path), map_location="cpu")
+        except Exception as e:  # noqa: BLE001 -- never block a run on this
+            print(f"[ckpt] {key}: {path}  (unreadable: {type(e).__name__})")
+            continue
+        epoch = blob.get("epoch") if isinstance(blob, dict) else None
+        prov = (blob.get("provenance") or {}) if isinstance(blob, dict) else {}
+        line = f"[ckpt] {key}: {path}  epoch={epoch}"
+        if prov.get("value") is not None:
+            line += f"  {prov.get('select_metric')}={prov['value']:.6f}"
+        if prov.get("output_dir"):
+            line += f"  run={prov['output_dir']}"
+        print(line)
+        if epoch == 0:
+            print(
+                f"[ckpt] WARNING: {key} is epoch 0 of its run. That is what "
+                "`checkpoint_best.pth` holds when a run was killed after its first "
+                "validation -- verify it against that run's train.log before trusting "
+                "anything downstream."
+            )
+        del blob
+
+
 def main():
     # strict: refuse to start on a known-bad stack rather than train for hours and
     # report loss=nan (which is exactly what transformers 5.x does here).
@@ -111,6 +154,7 @@ def main():
     cfg.model_cfg.rec_config.item_num = item_num
     print(f"user_num={user_num} item_num={item_num}")
     cfg.pretty_print()
+    report_checkpoint_provenance(cfg)
 
     model = task.build_model(cfg)
     print("trainable parameter groups:", model.trainable_summary()

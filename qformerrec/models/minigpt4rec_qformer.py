@@ -160,6 +160,17 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
         assert self.ablate_pref in ABLATION_MODES, (
             f"qformer.ablate_pref={self.ablate_pref!r} not in {ABLATION_MODES}"
         )
+        # CONTROL: the two CIE tokens, separately. `<UserID>` is the only per-user
+        # ID embedding in the prompt and therefore the only surface on which the
+        # model can memorise a user rather than generalise about them -- 256 free
+        # dimensions per user against ~46 training rows once stage 3 unfreezes MF.
+        # Splitting it from `<TargetItemID>` matters because they share `llama_proj`
+        # and so cannot be told apart by any weight-level inspection.
+        self.ablate_user_id = str(qf.get("ablate_user_id", "none"))
+        self.ablate_item_id = str(qf.get("ablate_item_id", "none"))
+        for n, v in (("ablate_user_id", self.ablate_user_id),
+                     ("ablate_item_id", self.ablate_item_id)):
+            assert v in ABLATION_MODES, f"qformer.{n}={v!r} not in {ABLATION_MODES}"
         self.query_gen = CandidateAwareQueryGenerator(
             d1=d1, d_q=d_q, n_query=self.n_query,
             use_candidate=bool(qf.get("use_candidate", True)),
@@ -192,9 +203,11 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
                 banner += f" title_pca={me.title_pca_dim} (evr={me.title_pca_evr:.3f})"
         # A control run must be identifiable from its log alone -- these three
         # lines are the difference between a result and an unexplained number.
-        if me.ablate != "none" or self.ablate_pref != "none" or not me.use_user_slot:
+        if (me.ablate != "none" or self.ablate_pref != "none" or not me.use_user_slot
+                or self.ablate_user_id != "none" or self.ablate_item_id != "none"):
             banner += (f"  CONTROL: memory.ablate={me.ablate} ablate_pref={self.ablate_pref} "
-                       f"user_slot={me.use_user_slot}")
+                       f"user_slot={me.use_user_slot} ablate_user_id={self.ablate_user_id} "
+                       f"ablate_item_id={self.ablate_item_id}")
         print(banner)
         logging.info(banner)
 
@@ -241,6 +254,10 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             # attention mass per type is not comparable across types: `user` is one
             # slot, `hist` is up to 50, so 0.5 vs 0.5 is a 50x difference per slot.
             "count_by_type": np.zeros(len(SLOT_TYPE_NAMES)),
+            # within-history attention shape -- see _accumulate_diag
+            "hist_attn_entropy": 0.0, "hist_attn_top1": 0.0,
+            "hist_attn_n_valid": 0.0,
+            "hist_attn_ent_ratio": 0.0, "hist_attn_ent_ratio_n": 0.0,
         }
 
     # ------------------------------------------------------------------ #
@@ -273,6 +290,8 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             # ---- CoLLM's own CIE tokens for <UserID> / <TargetItemID>
             user_tok = self.llama_proj(user_emb.unsqueeze(-2)).reshape(B, self.proj_token_num, d_llm)
             item_tok = self.llama_proj(item_emb.unsqueeze(-2)).reshape(B, self.proj_token_num, d_llm)
+            user_tok = ablate_content(user_tok, self.ablate_user_id)
+            item_tok = ablate_content(item_tok, self.ablate_item_id)
 
             # ---- memory bank -> candidate-aware queries -> preference tokens
             pit_hist = samples.get("PitHistItems")
@@ -446,10 +465,12 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             all_users, all_items = self.rec_encoder.computer()
             u = self.rec_encoder.user_encoder(uid, all_users=all_users).float()
             i = self.rec_encoder.item_encoder(iid, all_items=all_items).float()
+            ut = self.llama_proj(u.unsqueeze(-2)).reshape(B, self.proj_token_num, d_llm)
+            it = self.llama_proj(i.unsqueeze(-2)).reshape(B, self.proj_token_num, d_llm)
             return {
                 "PrefTokens": None,
-                "UserToken": self.llama_proj(u.unsqueeze(-2)).reshape(B, self.proj_token_num, d_llm),
-                "TargetItemToken": self.llama_proj(i.unsqueeze(-2)).reshape(B, self.proj_token_num, d_llm),
+                "UserToken": ablate_content(ut, self.ablate_user_id),
+                "TargetItemToken": ablate_content(it, self.ablate_item_id),
                 "Z": None, "A": None, "s_cf": None,
             }
 
@@ -550,6 +571,38 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
                 torch.einsum("bn,bnt->t", valid, onehot) / Af.shape[0]
             ).cpu().numpy()
 
+            # Shape of the attention INSIDE the history group. Both `attn_by_type`
+            # and `per_slot` are blind to this by construction: a token spreading
+            # 0.5 evenly over 30 history slots and a token putting 0.5 on one slot
+            # have the same group total AND the same per-slot mean. Only the
+            # distribution separates "the Q-Former selects" from "the Q-Former
+            # mean-pools" -- and a mean over ~30 of a user's item vectors is close
+            # to re-deriving that user's own vector, i.e. slot 0, which would
+            # explain why destroying the whole bank costs 0.0005 AUC.
+            #
+            # Normalised against log(n_valid) PER ROW, not log(k_hist): ~half of
+            # the 50 slots are padding on a typical row, so log(k_hist) is the
+            # wrong ceiling and would make a uniform read look selective.
+            k = self.memory_encoder.k_hist
+            if k > 0:
+                hm = enc["mask"][:, 1 : 1 + k].to(Af.dtype)          # (B, k)
+                ah = Af[:, :, 1 : 1 + k] * hm.unsqueeze(1)
+                ah = ah / ah.sum(-1, keepdim=True).clamp_min(1e-9)   # renormalise in-group
+                ent = -(ah * ah.clamp_min(1e-9).log()).sum(-1)       # (B, L)
+                n_valid = hm.sum(-1)                                 # (B,)
+                d["hist_attn_entropy"] += float(ent.mean())
+                d["hist_attn_top1"] += float(ah.max(-1).values.mean())
+                d["hist_attn_n_valid"] += float(n_valid.mean())
+                # rows with <2 valid slots have no entropy to speak of and a zero
+                # denominator; excluding them is the difference between a ratio and
+                # a division by log(1)
+                rows = n_valid >= 2
+                if bool(rows.any()):
+                    d["hist_attn_ent_ratio"] += float(
+                        (ent[rows] / n_valid[rows].log().unsqueeze(1)).mean()
+                    )
+                    d["hist_attn_ent_ratio_n"] += 1
+
         if self.diag_log_freq > 0 and self._step % self.diag_log_freq == 0:
             self.log_qformer_diagnostics()
 
@@ -572,6 +625,12 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             "history_source": self.memory_encoder.history_source,
             "k_hist": self.memory_encoder.k_hist,
         }
+        if self.memory_encoder.k_hist > 0 and d.get("hist_attn_ent_ratio_n", 0):
+            nr = d["hist_attn_ent_ratio_n"]
+            summary["hist_attn_entropy"] = d["hist_attn_entropy"] / n
+            summary["hist_attn_ent_ratio"] = d["hist_attn_ent_ratio"] / nr
+            summary["hist_attn_top1"] = d["hist_attn_top1"] / n
+            summary["hist_slots_valid"] = d["hist_attn_n_valid"] / n
         if not self.memory_encoder.use_user_slot:
             # under the `-user-slot` control, the fraction of rows that had nothing
             # else and kept slot 0 anyway. If this is not ~0 the control is leaky.
@@ -629,6 +688,17 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
         ratio = summary["pref_token_norm"] / max(self.llm_emb_norm_mean, 1e-8)
         if ratio > 2.0 or ratio < 0.5:
             msg.append(f"  WARNING: pref-token norm is {ratio:.2f}x the LLM embedding norm")
+        if summary.get("hist_attn_ent_ratio", 0.0) > 0.9:
+            msg.append(
+                f"  WARNING: within-history attention entropy is "
+                f"{summary['hist_attn_ent_ratio']:.3f} of uniform (top1="
+                f"{summary.get('hist_attn_top1', float('nan')):.4f} vs 1/n="
+                f"{1.0 / max(summary.get('hist_slots_valid', 1.0), 1.0):.4f}) -- the "
+                "Q-Former is mean-pooling the history, not selecting from it. A mean "
+                "over a user's item vectors is close to that user's own vector, so the "
+                "history slots would be re-deriving slot 0. Check the candidate path "
+                "with qformer.use_candidate=False before changing the architecture."
+            )
         if summary.get("user_vs_hist_per_slot", 0.0) > 10.0:
             msg.append(
                 f"  WARNING: the user slot draws {summary['user_vs_hist_per_slot']:.0f}x the "
@@ -694,6 +764,32 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
                 assert os.path.exists(path), f"{key} not found: {path}"
                 print(f"Load {key}: {path}")
                 sd = torch.load(path, map_location="cpu")
+                # Say WHICH run and WHICH epoch this file came from. A checkpoint
+                # copied into a shared ckpt/ dir carries no output_dir and no log,
+                # and `checkpoint_best.pth` from a run killed after its first
+                # validation looks identical to a good one -- same name, same size,
+                # same tensor list. That exact file was cached as the stage-1 LoRA
+                # and silently initialised every stage-2/3 run; control A read it
+                # as "text prompting is at chance" when it was "this LoRA saw 3 200
+                # samples". The epoch was in the file the whole time; nothing
+                # printed it.
+                epoch = sd.get("epoch") if isinstance(sd, dict) else None
+                prov = sd.get("provenance") if isinstance(sd, dict) else None
+                if epoch is not None or prov:
+                    print(f"  from epoch {epoch}"
+                          + (f"  {prov.get('select_metric')}={prov.get('value'):.6f}"
+                             if prov and prov.get("value") is not None else "")
+                          + (f"  run={prov.get('output_dir')}" if prov else ""))
+                if epoch == 0:
+                    warn = (
+                        f"WARNING: {key} is epoch 0 of its run. `checkpoint_best.pth` is "
+                        "epoch 0 whenever a run was killed after its first validation, so "
+                        "this may be a barely-trained checkpoint masquerading as a best "
+                        f"one -- verify against the train.log of the run that produced it "
+                        f"before trusting anything downstream of it. ({path})"
+                    )
+                    print(warn)
+                    logging.warning(warn)
                 sd = sd["model"] if "model" in sd else sd
                 msg = model.load_state_dict(sd, strict=False)
                 print(f"  unexpected keys: {list(msg.unexpected_keys)[:8]}")

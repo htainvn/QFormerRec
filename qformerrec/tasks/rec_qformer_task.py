@@ -18,6 +18,7 @@ wall-clock inference time per split.
 """
 
 import logging
+import os
 import time
 
 import numpy as np
@@ -153,7 +154,7 @@ class RecQFormerTask(RecBaseTask):
 
         results = {}
         for data_loader in loaders:
-            logits_all, labels_all, users_all = [], [], []
+            logits_all, labels_all, users_all, items_all = [], [], [], []
             prompt_tokens, token_cos = [], []
             mem_stat_sums, mem_stat_n = {}, 0
             n_samples = 0
@@ -167,6 +168,11 @@ class RecQFormerTask(RecBaseTask):
                 logits_all.extend(logits.cpu().numpy())
                 labels_all.extend(samples["label"].detach().cpu().numpy())
                 users_all.extend(samples["UserID"].detach().cpu().numpy())
+                # kept only for the score dump below: joining a prediction back to
+                # an item baseline needs the item id, and relying on the eval loader
+                # preserving dataframe order is an assumption that would break
+                # silently the day a sampler is added
+                items_all.extend(samples["TargetItemID"].detach().cpu().numpy())
                 if "n_prompt_tokens" in out:
                     prompt_tokens.append((float(out["n_prompt_tokens"]), logits.shape[0]))
                 if "token_cosine" in out:
@@ -225,6 +231,23 @@ class RecQFormerTask(RecBaseTask):
             for k, v in mem_stat_sums.items():
                 results[k] = round(v / max(mem_stat_n, 1), 4)
             results["agg_metrics"] = uauc if self.select_metric == "uauc" else auc
+
+            # Dump the per-row scores. Everything above this line collapses 10 401
+            # predictions into two scalars; anything that needs the predictions
+            # themselves -- blending against a bias/CF baseline, per-group
+            # calibration, error analysis by user or item frequency -- is impossible
+            # from AUC and UAUC alone, and re-running the LLM to get them back costs
+            # a GPU minute per split. Keyed by row count because the split names are
+            # not passed down to the task and the four counts are unique.
+            try:
+                out_dir = registry.get_path("output_dir")
+            except Exception:  # noqa: BLE001 -- a dump must never fail a run
+                out_dir = None
+            if out_dir and os.path.isdir(out_dir):
+                dump = os.path.join(out_dir, f"logits_{int(n_samples)}.npz")
+                np.savez(dump, uid=users_all, iid=np.asarray(items_all),
+                         label=labels_all, logit=logits_all)
+                logging.info("wrote per-row scores: %s (n=%d)", dump, n_samples)
 
             logging.info("UAUC users: %s", uauc_stats)
             extra = "" if not token_cos else f" ***token_cos: {results['token_cosine_offdiag']:.4f}"
