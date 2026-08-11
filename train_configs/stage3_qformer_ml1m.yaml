@@ -101,7 +101,27 @@ model:
       # Title semantics on the history slots. False reproduces every run before
       # 2026-08-11 exactly. Needs a memory index built with --llm_path.
       use_title: False
+      # A d_text=4096 title vector is one fixed vector per item id -- a perfect ID
+      # embedding handed to the model for free, i.e. a fingerprint by construction,
+      # not learned semantics. >0 cuts it to that many principal directions, which
+      # destroys individual-item identifiability while keeping the coarse structure
+      # (same-genre items stay clustered). 16-32 is the range that tests the
+      # hypothesis; 0 keeps the full width. See RUNSHEET 6.6, control C.
+      title_pca_dim: 0
+      # ---- CONTROLS (RUNSHEET 6.6). Leave at the defaults for real runs.
+      # none | random | shuffle | mean -- destroy the bank's content, keep its
+      # shape, scale, slot count, mask and attention prior. `shuffle` is the
+      # strongest (exact real marginals, only the row pairing is broken).
+      ablate: none
+      # False masks slot 0, the user's own MF row. It is 1 slot of 65 but draws
+      # ~0.5 of the attention mass -- ~40x an average history slot -- so "the
+      # Q-Former just re-reads slot 0" is not ruled out by the type heatmap.
+      user_slot: True
       memory_index_path: /content/ckpt/memory_index_ml1m.pkl
+    # CONTROL, one level up: ablate the L soft tokens that actually reach the LLM.
+    # none | random | shuffle | mean. Combined with memory.ablate this separates
+    # "the memory is uninformative" from "the LLM ignores the soft tokens".
+    ablate_pref: none
   loss:
     lambda_rank: 0.5
     lambda_cf: 0.2

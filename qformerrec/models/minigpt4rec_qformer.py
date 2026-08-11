@@ -27,6 +27,7 @@ from minigpt4.common.registry import registry
 from minigpt4.models.minigpt4rec_v2 import MiniGPT4Rec_v2
 
 from qformerrec.models.qformer_cie import (
+    ABLATION_MODES,
     PREF_TOKEN_FLAG,
     SLOT_TYPE_NAMES,
     TITLE_LIST_FLAG,
@@ -36,6 +37,7 @@ from qformerrec.models.qformer_cie import (
     LLMProjector,
     MemoryEncoder,
     NoNormLLMProjector,
+    ablate_content,
     attention_disagreement_loss,
     llm_target_rms,
     mean_offdiag_cosine,
@@ -46,6 +48,26 @@ from qformerrec.models.qformer_cie import (
     vocab_align_loss,
     within_user_rank_loss,
 )
+
+def _as_bool(v, name):
+    """Strict bool coercion for config flags that gate a control.
+
+    ``bool("False")`` is ``True``, so a flag that arrives as a string -- which is
+    what a stray quote in an ``--options`` override produces -- would silently turn
+    a control OFF and the run would look like a control that found nothing. Fail
+    instead.
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+        return v.strip().lower() == "true"
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    raise ValueError(
+        f"{name}={v!r} is not a boolean. Pass it unquoted, e.g. "
+        f"--options {name}=False"
+    )
+
 
 def _to_dict(node):
     """omegaconf DictConfig (or None) -> plain dict."""
@@ -121,7 +143,22 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             k_cluster=mem_cfg.get("k_cluster", 3),
             dropout=float(qf.get("dropout", 0.1)),
             use_slot_prior=bool(qf.get("use_slot_prior", True)),
-            use_title=bool(mem_cfg.get("use_title", False)),
+            use_title=_as_bool(mem_cfg.get("use_title", False), "model.qformer.memory.use_title"),
+            title_pca_dim=int(mem_cfg.get("title_pca_dim", 0)),
+            ablate=str(mem_cfg.get("ablate", "none")),
+            use_user_slot=_as_bool(
+                mem_cfg.get("user_slot", True), "model.qformer.memory.user_slot"
+            ),
+        )
+        # CONTROL, one level above the memory bank: ablate the L soft tokens
+        # themselves, i.e. what actually reaches the LLM. Together with
+        # `memory.ablate` this separates the two failure modes that look identical
+        # from the outside -- "the memory says nothing useful but the LLM does read
+        # the tokens" (memory ablation moves the metric, pref ablation moves it
+        # more) from "the LLM ignores the soft tokens entirely" (neither moves it).
+        self.ablate_pref = str(qf.get("ablate_pref", "none"))
+        assert self.ablate_pref in ABLATION_MODES, (
+            f"qformer.ablate_pref={self.ablate_pref!r} not in {ABLATION_MODES}"
         )
         self.query_gen = CandidateAwareQueryGenerator(
             d1=d1, d_q=d_q, n_query=self.n_query,
@@ -142,13 +179,24 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
         self.pref_proj = proj_cls(
             d_q, d_llm, target_rms=self.llm_emb_rms, dropout=float(qf.get("dropout", 0.1))
         )
-        print(
-            f"[qformer] d_q={d_q} L={self.n_query} slots={self.memory_encoder.n_slots} "
+        me = self.memory_encoder
+        banner = (
+            f"[qformer] d_q={d_q} L={self.n_query} slots={me.n_slots} "
             f"layers={len(self.qformer.layers)} llm_emb_norm={self.llm_emb_norm_mean:.4f} "
             f"target_rms={self.llm_emb_rms:.6f} match_llm_norm={self.match_llm_norm} "
-            f"use_title={self.memory_encoder.use_title}"
-            + (f" d_text={self.memory_encoder.d_text}" if self.memory_encoder.use_title else "")
+            f"use_title={me.use_title}"
         )
+        if me.use_title:
+            banner += f" d_text={me.d_text}"
+            if me.title_pca_dim > 0:
+                banner += f" title_pca={me.title_pca_dim} (evr={me.title_pca_evr:.3f})"
+        # A control run must be identifiable from its log alone -- these three
+        # lines are the difference between a result and an unexplained number.
+        if me.ablate != "none" or self.ablate_pref != "none" or not me.use_user_slot:
+            banner += (f"  CONTROL: memory.ablate={me.ablate} ablate_pref={self.ablate_pref} "
+                       f"user_slot={me.use_user_slot}")
+        print(banner)
+        logging.info(banner)
 
         self.cf_head = CFAuxHead(d_q)
 
@@ -189,6 +237,10 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             "loss_div": 0.0, "loss_attn": 0.0, "loss_var": 0.0, "loss_align": 0.0,
             "rank_pairs": 0.0, "hist_unk_rate": 0.0, "hist_slots_filled": 0.0,
             "attn_by_type": np.zeros((self.n_query, len(SLOT_TYPE_NAMES))),
+            # mean number of *unmasked* slots of each type per row. Needed because
+            # attention mass per type is not comparable across types: `user` is one
+            # slot, `hist` is up to 50, so 0.5 vs 0.5 is a 50x difference per slot.
+            "count_by_type": np.zeros(len(SLOT_TYPE_NAMES)),
         }
 
     # ------------------------------------------------------------------ #
@@ -234,6 +286,11 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             attn_bias = attn_bias + torch.log(prior.clamp_min(1e-6)).unsqueeze(1)
             Z, A = self.qformer(queries, mem, mask, attn_bias)                 # (B,L,d_q), (B,L,N)
             pref_tok = self.pref_proj(Z)                                       # (B, L, d_llm)
+            # CONTROL: what the LLM actually receives. Applied after the RMS
+            # matching so the tokens keep the norm the projector was tuned to
+            # produce -- the control is "these tokens carry no information", not
+            # "these tokens are the wrong size".
+            pref_tok = ablate_content(pref_tok, self.ablate_pref)
             s_cf = self.cf_head(Z, cand_code)
 
         return {
@@ -488,6 +545,10 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             onehot = F.one_hot(tid, T).to(Af.dtype)           # (B, N, T)
             per_type = torch.einsum("bln,bnt->lt", Af, onehot) / Af.shape[0]
             d["attn_by_type"] += per_type.cpu().numpy()
+            valid = enc["mask"].to(Af.dtype)                   # (B, N)
+            d["count_by_type"] += (
+                torch.einsum("bn,bnt->t", valid, onehot) / Af.shape[0]
+            ).cpu().numpy()
 
         if self.diag_log_freq > 0 and self._step % self.diag_log_freq == 0:
             self.log_qformer_diagnostics()
@@ -511,10 +572,34 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             "history_source": self.memory_encoder.history_source,
             "k_hist": self.memory_encoder.k_hist,
         }
+        if not self.memory_encoder.use_user_slot:
+            # under the `-user-slot` control, the fraction of rows that had nothing
+            # else and kept slot 0 anyway. If this is not ~0 the control is leaky.
+            summary["user_slot_kept"] = d.get("user_slot_kept", 0.0) / n
         for k in ["loss_bce", "loss_rank", "loss_cf", "loss_div", "loss_attn", "loss_var", "loss_align"]:
             if d.get(k, 0.0):
                 summary[k] = d[k] / n
         attn = d["attn_by_type"] / n
+        count = d["count_by_type"] / n
+        # Per-slot mass. The per-type totals alone cannot answer "is the model
+        # just re-reading slot 0?": `user` is always exactly one slot while `hist`
+        # is up to 50, so equal type totals mean the user slot is ~50x heavier per
+        # slot. This is the ratio that has to fall for the memory to be doing work.
+        per_slot = attn / np.maximum(count, 1e-6)[None, :]
+        # pooled over both history types, not the sum of their two per-slot rates:
+        # `hist_unk` holds ~0.02 slots per row on ML-1M, so its own rate is a ratio
+        # of two near-zero numbers and would dominate a sum.
+        # Reported only when there ARE history slots: under `-memory`/`-hist` the
+        # denominator is 0 and the ratio would come out as ~1e9 and fire the warning
+        # below on a configuration that has nothing to warn about.
+        hist_types = [SLOT_TYPE_NAMES.index("hist"), SLOT_TYPE_NAMES.index("hist_unk")]
+        n_hist_slots = float(count[hist_types].sum())
+        if n_hist_slots > 1e-3:
+            hist_slot_mass = attn[:, hist_types].sum(axis=1) / n_hist_slots
+            summary["user_vs_hist_per_slot"] = float(
+                per_slot[:, SLOT_TYPE_NAMES.index("user")].mean()
+                / max(float(hist_slot_mass.mean()), 1e-9)
+            )
         with torch.no_grad():
             type_bias = self.query_gen.type_bias.detach().float().softmax(-1).cpu().numpy()
 
@@ -523,13 +608,19 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
             for k, v in summary.items()
         ))
+        msg.append("  slots_per_row=["
+                   + " ".join(f"{SLOT_TYPE_NAMES[t]}:{count[t]:.2f}" for t in range(len(count)))
+                   + "]")
         for l in range(attn.shape[0]):
             top = np.argsort(-attn[l])[:3]
             msg.append(
                 f"  token{l}: attn_by_type=["
                 + " ".join(f"{SLOT_TYPE_NAMES[t]}:{attn[l, t]:.3f}" for t in range(attn.shape[1]))
                 + f"]  top3={[SLOT_TYPE_NAMES[t] for t in top]}"
-                + "  type_bias_softmax=["
+                + "  per_slot=["
+                + " ".join(f"{SLOT_TYPE_NAMES[t]}:{per_slot[l, t]:.4f}"
+                           for t in range(attn.shape[1]))
+                + "]  type_bias_softmax=["
                 + " ".join(f"{v:.3f}" for v in type_bias[l])
                 + "]"
             )
@@ -538,6 +629,12 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
         ratio = summary["pref_token_norm"] / max(self.llm_emb_norm_mean, 1e-8)
         if ratio > 2.0 or ratio < 0.5:
             msg.append(f"  WARNING: pref-token norm is {ratio:.2f}x the LLM embedding norm")
+        if summary.get("user_vs_hist_per_slot", 0.0) > 10.0:
+            msg.append(
+                f"  WARNING: the user slot draws {summary['user_vs_hist_per_slot']:.0f}x the "
+                "attention of an average history slot -- the bank is close to a "
+                "re-read of slot 0. Control it with qformer.memory.user_slot=False"
+            )
         logging.info("\n".join(msg))
         print("\n".join(msg))
 
@@ -545,6 +642,8 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             payload = {
                 "summary": summary,
                 "attn_by_type": attn.tolist(),
+                "count_by_type": count.tolist(),
+                "attn_per_slot": per_slot.tolist(),
                 "type_bias_softmax": type_bias.tolist(),
                 "slot_type_names": SLOT_TYPE_NAMES,
                 "tag": tag,

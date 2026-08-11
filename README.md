@@ -77,11 +77,12 @@ scripts/
   pretrain_mf.py                   stage 0 (parameterised port of CoLLM's MF baseline)
   build_memory.py                  stage 0b: the train-only fitted objects + item_in_train
   check_pit_history.py             proves the per-row history is point-in-time, not leakage
+  check_title_memory.py            title path pre-flight + the PCA identifiability sweep
   s3_sync.sh                       push/pull checkpoints to S3-compatible storage
   doctor.py                        one-command setup diagnostic
-  smoke_test.py                    75 CPU checks, no LLM needed
-  integration_test.py              end to end on a tiny random LLaMA, incl. 21 ablations
-train_configs/                     stage1/2/3 × {ml1m, amazon}
+  smoke_test.py                    CPU checks, no LLM needed (incl. the 6.6 controls)
+  integration_test.py              end to end on a tiny random LLaMA, incl. 29 ablations + controls
+train_configs/                     stage1/2/3 × {ml1m, amazon}, plus control_stage1_text_ml1m
 prompts/                           short / terse / +titles / tallrec, per dataset
 train_qformer.py                   entry point for all stages
 ```

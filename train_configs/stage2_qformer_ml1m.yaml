@@ -120,7 +120,16 @@ model:
       # Title semantics on the history slots. False reproduces every run before
       # 2026-08-11 exactly. Needs a memory index built with --llm_path.
       use_title: False
+      # Cut the 4096-d title vector to this many principal directions. A full-width
+      # title vector is one fixed vector per item id, i.e. a free perfect ID
+      # embedding; 16-32 keeps coarse semantics and destroys the fingerprint.
+      # See RUNSHEET 6.6, control C.
+      title_pca_dim: 0
+      # ---- CONTROLS (RUNSHEET 6.6). Leave at the defaults for real runs.
+      ablate: none                # none | random | shuffle | mean
+      user_slot: True             # False masks slot 0 (the user's own MF row)
       memory_index_path: /content/ckpt/memory_index_ml1m.pkl
+    ablate_pref: none             # none | random | shuffle | mean -- see RUNSHEET 6.6
   loss:
     lambda_rank: 0.5
     lambda_cf: 0.2

@@ -669,6 +669,23 @@ def main():
         "n_layers=1": {"qformer.n_layers": 1},
         "n_layers=3": {"qformer.n_layers": 3},
         "dot-glue": {"soft_token_glue": "."},
+        # ---- the controls of RUNSHEET 6.6. They go through the same
+        # build + train-a-step + evaluate path as everything above, because a
+        # control that crashes on the real config is worse than no control: it
+        # gets quietly dropped and the question it was asked to settle stays open.
+        "ctl-mem-random": {"qformer.memory.ablate": "random"},
+        "ctl-mem-shuffle": {"qformer.memory.ablate": "shuffle"},
+        "ctl-mem-mean": {"qformer.memory.ablate": "mean"},
+        "ctl-pref-shuffle": {"qformer.ablate_pref": "shuffle"},
+        "ctl-pref-mean": {"qformer.ablate_pref": "mean"},
+        "ctl-no-user-slot": {"qformer.memory.user_slot": False},
+        # slot 0 masked AND no history to fall back on: every row hits the
+        # keep-slot-0 fallback, which is the case that would NaN if it were missing
+        "ctl-no-user-slot-no-hist": {"qformer.memory.user_slot": False,
+                                     "qformer.memory.k_hist": 0,
+                                     "qformer.memory.k_neighbor": 0,
+                                     "qformer.memory.k_genre": 0,
+                                     "qformer.memory.k_cluster": 0},
     }
     for name, overrides in ablations.items():
         mcfg = OmegaConf.create(OmegaConf.to_container(build_cfg(args, llama_path, 2).model))

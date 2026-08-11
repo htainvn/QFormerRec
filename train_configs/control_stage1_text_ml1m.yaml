@@ -1,0 +1,123 @@
+# ---------------------------------------------------------------------------
+# CONTROL A -- the stage-1 LoRA checkpoint, alone, on the plain text prompt,
+# evaluated on the SAME valid split every other run reports.
+#
+# This is the control that has to run before any hypothesis about *why* the
+# Q-Former is flat, because a positive result makes the rest irrelevant. There is
+# no Q-Former here, no memory bank, no <UserID>, no <TargetItemID>: legacy
+# `mini_gpt4rec_v2`, the TALLRec prompt with history titles rendered as text, and
+# the stage-1 LoRA. Whatever this scores is what the LLM can do from text alone.
+#
+# Read it against the numbers already on the board:
+#
+#   stage-3 full model, best valid auc      0.7296  (epoch 6)
+#   abl_nomemory (1 slot, user only)        0.7296  (epoch 2)
+#   THIS                                    ?
+#
+# If this also lands at ~0.725-0.730, the entire collaborative branch -- memory
+# bank, Q-Former, soft tokens, MF CIE tokens -- is contributing zero, and the
+# diagnosis is not "the model memorises" but "the LLM never reads the soft
+# tokens". Those need different fixes, and the memorisation work is wasted effort
+# until this number is known.
+#
+# If this lands clearly BELOW (say <= 0.70), the collaborative branch is worth
+# something and the question becomes what that something is -- run the
+# `memory.ablate` / `ablate_pref` controls next (see RUNSHEET 6.6).
+#
+# Two things that must match the runs it is compared against, or the comparison
+# is void:
+#   * `valid_split: valid` -- the full 10 401-row valid set. The dataset default
+#     is `valid_small` (5 200 rows), which is a DIFFERENT set, not a subsample
+#     with more noise. Stage 2/3 both set `valid`.
+#   * `test_splits: [valid]` with `evaluate: True` -- report on valid, not test.
+#     Nothing here should touch test.
+#
+# Cost: one evaluation pass, ~85 s on the A100 (n=10 401). Not a training run.
+#
+#   !python train_qformer.py --cfg-path train_configs/control_stage1_text_ml1m.yaml \
+#       --options model.ckpt=/content/ckpt/stage1_lora_ml1m.pth
+# ---------------------------------------------------------------------------
+model:
+  arch: mini_gpt4rec_v2       # the legacy arch: no Q-Former, no memory bank
+  model_type: pretrain_vicuna
+  freeze_rec: True
+  freeze_proj: True
+  freeze_lora: True           # nothing trains; this is an evaluation
+  max_txt_len: 1024
+  proj_token_num: 1
+  proj_drop: 0
+  proj_mid_times: 10          # MUST match stage 1, or its checkpoint will not load
+  end_sym: "###"
+  # The point of the control: text only. No <PrefTokens>, no <UserID>, no
+  # <TargetItemID> -- exactly the prompt stage 1 was trained on.
+  prompt_path: "prompts/tallrec_movie.txt"
+  prompt_template: '{}'
+  llama_model: /content/vicuna-7b-v0
+  user_num: -100
+  item_num: -100
+  ans_type: 'v2'
+  rec_model: "MF"
+
+  # `mini_gpt4rec_v2` loads weights from `ckpt`, not `ckpt_lora` (that key is the
+  # Q-Former arch's). Point this at the stage-1 best.
+  ckpt: /content/ckpt/stage1_lora_ml1m.pth
+
+  lora_config:
+    use_lora: True
+    r: 8
+    alpha: 16
+    target_modules: ["q_proj", "v_proj"]
+    dropout: 0.05
+  rec_config:
+    user_num: -100
+    item_num: -100
+    embedding_size: 256
+    pretrained_path: /content/ckpt/mf_ml1m_d256.pth
+
+datasets:
+  movie_ood_qf:
+    path: /content/data/ml-1m/
+    data_type: default
+    pit_hist_width: 50
+    valid_split: valid        # the full 10 401-row split -- see the header
+    build_info:
+      storage: /content/data/ml-1m/
+
+run:
+  task: rec_qformer
+  runner: rec_runner_qformer
+  lr_sched: "linear_warmup_cosine_lr_scaled"
+  init_lr: 1e-4               # unused: evaluate: True
+  min_lr: 1e-5
+  warmup_lr: 1e-6
+  mode: 'v2'
+  select_metric: uauc
+  grad_clip: 1.0
+  fp32_trainable: True
+
+  user_grouped_sampler: False
+  max_epoch: 1
+  iters_per_epoch: 1
+  batch_size_train: 32
+  batch_size_eval: 64
+  num_workers: 4
+  warmup_steps: 0
+
+  seed: 42
+  output_dir: /content/logs/control_stage1_text
+
+  amp: True
+  resume_ckpt_path: null
+
+  # evaluation only. `valid_splits` stays non-empty so the runner takes the
+  # skip_reload path (it will not try to reload a checkpoint_best.pth that this
+  # fresh output_dir does not have).
+  evaluate: True
+  train_splits: ["train"]
+  valid_splits: ["valid"]
+  test_splits: ["valid"]
+
+  device: "cuda"
+  world_size: 1
+  dist_url: "env://"
+  distributed: False

@@ -17,9 +17,15 @@ look like "the idea does not work":
   4. `use_title=True` changes the memory tensor, and only on history slots;
   5. gradient reaches `title_proj`;
   6. the MF and title branches contribute comparably at init -- equal input norms
-     are not enough, since the two projections differ by 1/sqrt(fan_in).
+     are not enough, since the two projections differ by 1/sqrt(fan_in);
+  7. how much individual-item identifiability each candidate `title_pca_dim`
+     destroys, and how much variance it keeps. Check [3] passing means the titles
+     are discriminative, which is also exactly what "a free perfect ID embedding"
+     looks like -- this is the cheap half of RUNSHEET 6.6 control C, run it before
+     spending a training run on a width.
 
-Exits non-zero on the first failure, with the number that failed.
+Exits non-zero on the first failure, with the number that failed. Check [7] is
+informational and never fails: what counts as "enough variance kept" is a judgement.
 """
 
 import argparse
@@ -31,7 +37,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from qformerrec.models.qformer_cie import MemoryEncoder  # noqa: E402
+from qformerrec.models.qformer_cie import MemoryEncoder, pca_reduce  # noqa: E402
 
 
 def main():
@@ -46,7 +52,12 @@ def main():
     ap.add_argument("--d_q", type=int, default=128)
     ap.add_argument("--k_hist", type=int, default=50)
     ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--title_pca_dims", default="16,32",
+                    help="widths to measure in check [7] (comma separated; empty to skip). "
+                         "Each one costs an eigh on the (d_text, d_text) scatter matrix -- "
+                         "a few seconds at d_text=4096.")
     args = ap.parse_args()
+    args.title_pca_dims = [int(k) for k in str(args.title_pca_dims).split(",") if k.strip()]
 
     with open(args.memory_index, "rb") as f:
         mi = pickle.load(f)
@@ -95,6 +106,43 @@ def main():
         "left-padding bug (reading a PAD position), a layer that carries no semantics, or "
         "a template so long it drowns the title."
     )
+
+    # ---- 7. how much of the FINGERPRINT does PCA actually destroy?
+    #
+    # Check [3] passing is not only good news. A d_text=4096 vector is one fixed
+    # vector per item id, so "discriminative" and "a perfect ID embedding handed
+    # over for free" are the same measurement. If titles help, that has to be ruled
+    # out before it is called semantics -- RUNSHEET 6.6, control C. This is the
+    # cheap half of that control: measure identifiability at each candidate width
+    # here (seconds) before spending a training run on one.
+    #
+    # `near_dup` is the fraction of sampled items whose nearest *other* item sits
+    # above cosine 0.99, i.e. items the bank can no longer tell apart. That number
+    # rising is the mechanism the control depends on; `evr` is what is kept.
+    if args.title_pca_dims:
+        te_t = torch.as_tensor(te)
+        cov_t = torch.as_tensor(cov)
+        print(f"[7] identifiability vs PCA width (fitted on all {int(cov.sum())} "
+              "covered rows, cosine stats on the same sample as [3])")
+        print(f"        {'k':>6}  {'evr':>6}  {'mean_cos':>8}  {'p95':>7}  {'max':>7}  near_dup")
+        S_full = S.copy()
+        np.fill_diagonal(S_full, -1.0)
+        nd_full = float((S_full.max(axis=1) > 0.99).mean())
+        print(f"        {te.shape[1]:>6}  {1.0:>6.3f}  {off.mean():>8.4f}  "
+              f"{np.percentile(off, 95):>7.4f}  {off.max():>7.4f}  {nd_full:.2%}")
+        for k in args.title_pca_dims:
+            red, evr = pca_reduce(te_t, k, cov_t)
+            Y = red[idx].numpy()
+            Yn = Y / (np.linalg.norm(Y, axis=1, keepdims=True) + 1e-8)
+            Sk = Yn @ Yn.T
+            offk = Sk[~np.eye(len(idx), dtype=bool)]
+            np.fill_diagonal(Sk, -1.0)
+            nd = float((Sk.max(axis=1) > 0.99).mean())
+            print(f"        {k:>6}  {evr:>6.3f}  {offk.mean():>8.4f}  "
+                  f"{np.percentile(offk, 95):>7.4f}  {offk.max():>7.4f}  {nd:.2%}")
+        print("        Read it as: `evr` is the semantics kept, `near_dup` is the "
+              "identifiability destroyed. A k where near_dup is high and evr is still "
+              "reasonable is the one that tests the hypothesis.")
 
     # ---- 4/5. the encoder itself
     n_items = te.shape[0]

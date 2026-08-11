@@ -39,6 +39,15 @@ SLOT_TYPE_NAMES = ["user", "hist", "neighbor", "genre", "cluster", "hist_unk"]
 
 HIST_PAD = -1        # padding marker in the per-row history array
 
+# ---- content ablations (the controls) ------------------------------------- #
+# Each mode destroys the *information* in a tensor while leaving its shape and
+# its per-row scale intact, so the only thing that changes between the real run
+# and the control is what the numbers mean -- not how big they are, not how many
+# slots there are, and not which ones are masked. That matters: a control that
+# also changes the norm would confound "the content is useless" with "the norm
+# moved", and the norm is exactly what LayerNorm/RMS-matching are tuned around.
+ABLATION_MODES = ("none", "random", "shuffle", "mean")
+
 
 PREF_TOKEN_FLAG = "<PrefTokens>"
 # soft-token placeholders; resolved in order of appearance in the prompt string
@@ -72,6 +81,75 @@ def split_title_list(titles_str):
     if not titles_str or titles_str == "unkow":
         return []
     return titles_str.split('", "')
+
+
+def ablate_content(x, mode, perm=None):
+    """Return ``x`` with its information destroyed but its shape/scale kept.
+
+    ``random``  -- keep each row's RMS, randomise its direction. The scale is
+                   detached and the noise carries no grad, so a *training* run in
+                   this mode really trains with no information from ``x``.
+    ``shuffle`` -- permute along the batch axis. The strongest of the three: the
+                   marginal distribution of vectors is exactly the real one, only
+                   the pairing with the row is broken. Use this when the worry is
+                   "maybe the model just needs vectors of the right shape".
+    ``mean``    -- every row gets the batch mean, i.e. a constant. Isolates "does
+                   the model use the *per-user variation*" from "does it use the
+                   token at all".
+
+    ``perm`` lets two tensors (e.g. the MF side and the title side of the same
+    memory bank) be shuffled with the *same* permutation, so the control breaks
+    the row pairing without also decorrelating the two sources from each other.
+    """
+    if mode == "none":
+        return x
+    if mode == "random":
+        rms = x.detach().pow(2).mean(dim=-1, keepdim=True).sqrt()
+        return torch.randn_like(x) * rms
+    if mode == "shuffle":
+        if perm is None:
+            perm = torch.randperm(x.shape[0], device=x.device)
+        return x[perm]
+    if mode == "mean":
+        # `.contiguous()`: the caller reshapes / index-assigns this downstream, and
+        # an expanded view would silently materialise a copy at each of those.
+        return x.mean(dim=0, keepdim=True).expand_as(x).contiguous()
+    raise ValueError(f"unknown ablation mode {mode!r}, expected one of {ABLATION_MODES}")
+
+
+def pca_reduce(X, k, covered=None, eps=1e-6):
+    """Project the rows of ``X`` onto their top-``k`` principal directions.
+
+    Fitted on the covered rows only: uncovered rows are all-zero in the artifact
+    and would otherwise drag the mean. The output is rescaled to unit mean row
+    norm -- the same convention ``build_memory.py`` applies to the full-width
+    table -- so every downstream scale argument (the ``title_proj`` rescale, the
+    LayerNorm after it) holds unchanged at any ``k``.
+
+    Uses ``eigh`` on the (d_text, d_text) scatter matrix rather than
+    ``torch.pca_lowrank``: lowrank draws a random projection, which would consume
+    RNG inside ``MemoryEncoder.__init__`` and shift every module built after it,
+    so ``title_pca_dim=0`` vs ``32`` at one seed would differ in more than the
+    PCA. ``eigh`` is deterministic. Cost is one (d_text, d_text) gram + an eigh:
+    ~67 MB and a few seconds at d_text=4096, paid once at model construction.
+
+    Returns ``(reduced (I, k) float32, explained_variance_ratio)``.
+    """
+    X = X.float()
+    idx = (torch.nonzero(covered).squeeze(-1) if covered is not None
+           else torch.arange(X.shape[0]))
+    obs = X[idx]
+    mu = obs.mean(dim=0, keepdim=True)
+    Xc = obs - mu
+    k = int(min(k, Xc.shape[0], Xc.shape[1]))
+    evals, evecs = torch.linalg.eigh(Xc.t() @ Xc)          # ascending
+    V = evecs[:, -k:].flip(-1)                             # (d_text, k), descending
+    proj = Xc @ V
+    scale = proj.norm(dim=1).mean().clamp_min(eps)
+    out = X.new_zeros(X.shape[0], k)
+    out[idx] = proj / scale
+    total = evals.clamp_min(0).sum().clamp_min(eps)
+    return out, float((evals[-k:].clamp_min(0).sum() / total).item())
 
 
 # --------------------------------------------------------------------------- #
@@ -115,10 +193,24 @@ class MemoryEncoder(nn.Module):
         use_slot_prior=True,
         history_source="pit",
         use_title=False,
+        title_pca_dim=0,
+        ablate="none",
+        use_user_slot=True,
     ):
         super().__init__()
         assert history_source in ("pit", "train_only"), history_source
+        assert ablate in ABLATION_MODES, f"memory.ablate={ablate!r} not in {ABLATION_MODES}"
         self.history_source = history_source
+        # CONTROL: destroy the bank's content, keep its geometry. See the header
+        # of `ablate_content`. Applied to the slot vectors *before* projection, so
+        # `type_emb`/`rank_emb`/the slot mask/the attention prior are all still the
+        # real ones -- only what the slots say is fake.
+        self.ablate = ablate
+        # CONTROL: mask slot 0. The user's own MF row is one slot out of 65 but
+        # carries ~0.5 of the attention mass, so "the Q-Former just re-computes
+        # slot 0" is not ruled out by the per-type heatmap alone. Rows that would
+        # be left with no valid key at all keep it (the softmax needs one).
+        self.use_user_slot = bool(use_user_slot)
         # allow ablations to switch a slot type off by asking for 0 of them
         self.k_hist = int(k_hist)
         if history_source == "train_only":
@@ -217,13 +309,26 @@ class MemoryEncoder(nn.Module):
             # ~560 MB on Amazon-Book. Non-persistent, so it never enters a
             # checkpoint -- it is rebuilt from the artifact on every load.
             t_init = torch.as_tensor(np.asarray(memory_index["title_emb"]), dtype=torch.float)
-            self.d_text = t_init.shape[1]
             assert t_init.shape[0] == self.item_in_train.shape[0], (
                 f"title_emb covers {t_init.shape[0]} items but the artifact's item tables "
                 f"have {self.item_in_train.shape[0]} -- mismatched memory index"
             )
+            t_covered = torch.as_tensor(
+                np.asarray(memory_index["title_covered"]), dtype=torch.bool
+            )
+            # CONTROL: a d_text=4096 title vector is a *fingerprint by construction*
+            # -- one fixed vector per item id, i.e. a perfect ID embedding the model
+            # never had to learn. Cutting it to 16-32 principal directions destroys
+            # the capacity to identify an individual item while keeping the coarse
+            # semantics (items of one genre stay clustered), so a run that improves
+            # here was reading semantics and a run that does not was reading the id.
+            self.title_pca_dim = int(title_pca_dim)
+            self.title_pca_evr = None
+            if self.title_pca_dim > 0:
+                t_init, self.title_pca_evr = pca_reduce(t_init, self.title_pca_dim, t_covered)
+            self.d_text = t_init.shape[1]
             self.register_buffer("title_emb", t_init, persistent=False)
-            _buf("title_covered", memory_index["title_covered"], torch.bool)
+            self.register_buffer("title_covered", t_covered, persistent=False)
             # mirrors `unk_item`: a learned stand-in for ids with no title at all
             self.unk_title = nn.Parameter(torch.randn(self.d_text) * 0.02)
             self.title_proj = nn.Linear(self.d_text, d_q, bias=False)
@@ -239,6 +344,8 @@ class MemoryEncoder(nn.Module):
                 self.title_proj.weight.mul_((self.d_text / d1) ** 0.5)
         else:
             self.d_text = 0
+            self.title_pca_dim = 0
+            self.title_pca_evr = None
         self.ln = nn.LayerNorm(d_q)
         self.drop = nn.Dropout(dropout)
 
@@ -333,7 +440,23 @@ class MemoryEncoder(nn.Module):
         mask = torch.cat(masks, dim=1)                     # (B, N)
         prior = torch.cat(priors, dim=1).float()           # (B, N)
 
+        # CONTROL: drop the user's own slot. Kept for rows that have nothing else,
+        # otherwise their cross-attention softmax would be over an all-masked key
+        # set and come out NaN.
+        if not self.use_user_slot:
+            other = mask[:, 1:].any(dim=1) if mask.shape[1] > 1 else torch.zeros_like(mask[:, 0])
+            mask[:, 0] = ~other
+            stats["user_slot_kept"] = float(mask[:, 0].float().mean())
+
         raw = raw * mask.unsqueeze(-1)                     # zero out padded rows
+        # CONTROL: ablate the slot *contents*. One permutation shared with the
+        # title branch below, so `shuffle` breaks the row->memory pairing without
+        # also tearing an item's MF row away from its own title.
+        ablate_perm = None
+        if self.ablate != "none":
+            if self.ablate == "shuffle":
+                ablate_perm = torch.randperm(B, device=uid.device)
+            raw = ablate_content(raw, self.ablate, ablate_perm) * mask.unsqueeze(-1)
         mem = self.proj(raw) + self.type_emb(type_ids)      # type_ids is (B, N)
 
         # title semantics, added only on the history block. Same out-of-place shape
@@ -343,7 +466,10 @@ class MemoryEncoder(nn.Module):
             t = self.title_emb[hist_safe]                              # (B, k_hist, d_text)
             t = torch.where(self.title_covered[hist_safe].unsqueeze(-1),
                             t, self.unk_title.view(1, 1, -1))
-            t = self.title_proj(t * hist_mask.unsqueeze(-1))           # (B, k_hist, d_q)
+            t = t * hist_mask.unsqueeze(-1)
+            if self.ablate != "none":
+                t = ablate_content(t, self.ablate, ablate_perm) * hist_mask.unsqueeze(-1)
+            t = self.title_proj(t)                                     # (B, k_hist, d_q)
             parts = [mem.new_zeros(B, 1, self.d_q), t]
             n_tail = self.n_slots - 1 - self.k_hist
             if n_tail > 0:

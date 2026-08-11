@@ -171,7 +171,12 @@ class RecQFormerTask(RecBaseTask):
                     prompt_tokens.append((float(out["n_prompt_tokens"]), logits.shape[0]))
                 if "token_cosine" in out:
                     token_cos.append(float(out["token_cosine"]))
-                for k in ("hist_unk_rate", "hist_slots_filled"):
+                # `user_slot_kept` only appears under the `-user-slot` control
+                # (RUNSHEET 6.6 D); it is the fraction of rows that had no other
+                # valid slot and kept slot 0 anyway, i.e. how leaky the control is.
+                # Without it here the control is uninterpretable in an eval-only run,
+                # which is the only way it is meant to be run.
+                for k in ("hist_unk_rate", "hist_slots_filled", "user_slot_kept"):
                     if k in out:
                         mem_stat_sums[k] = mem_stat_sums.get(k, 0.0) + float(out[k])
                 if mem_stat_sums:
@@ -226,6 +231,8 @@ class RecQFormerTask(RecBaseTask):
             if "hist_unk_rate" in results:
                 extra += (f" ***hist_slots: {results['hist_slots_filled']:.2f}"
                           f" ***hist_unk: {results['hist_unk_rate']:.2%}")
+            if "user_slot_kept" in results:
+                extra += f" ***user_slot_kept: {results['user_slot_kept']:.2%}"
             logging.info(
                 "Averaged stats: %s ***auc: %.6f ***uauc: %.6f ***prompt_tokens: %.2f "
                 "***eval_s: %.1f (%.2f ms/sample, n=%d)%s",

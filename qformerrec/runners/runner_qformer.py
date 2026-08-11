@@ -394,6 +394,19 @@ class RecRunnerQFormer(RecRunnerBase):
                     f"user-grouped batch is {batch_sampler.batch_size} (<32). L_var/L_div/L_rank "
                     "are computed inside a micro-batch; set strict_batch: False to override."
                 )
+                # Say so in the log. `L_rank` is the only term that touches UAUC
+                # directly and it silently contributes ZERO whenever the batch has no
+                # same-user pos/neg pair -- which is exactly what happens if this
+                # sampler is not the one in use. A stage-3 run has already been
+                # observed with `rank_pairs_per_batch=0.0000` in all 68 diagnostic
+                # blocks and no `loss_rank` line at all; without this line there is
+                # no way to tell from the log whether the sampler was even built.
+                logging.info(
+                    "train loader: UserGroupedBatchSampler U=%s x m=%s -> batch=%s "
+                    "(L_rank needs same-user pos/neg pairs; watch rank_pairs_per_batch "
+                    "in [qformer-diag] -- 0 means L_rank is contributing nothing)",
+                    n_users_per_batch, n_per_user, batch_sampler.batch_size,
+                )
                 loader = DataLoader(
                     dataset, batch_sampler=batch_sampler, num_workers=nw,
                     pin_memory=True, collate_fn=collate_fn,

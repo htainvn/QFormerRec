@@ -10,7 +10,12 @@ Checks the parts that do not need Vicuna weights:
   6. the <unk>-substitution splicing writes each soft block at the right
      position, in prompt order (the failure mode that silently scrambles
      <PrefTokens> / <UserID> / <TargetItemID>),
-  7. the user-grouped sampler yields same-user pos/neg pairs.
+  7. the user-grouped sampler yields same-user pos/neg pairs,
+  8. the controls (RUNSHEET 6.6) destroy information without moving the geometry:
+     `memory.ablate`, `ablate_pref`, `user_slot=False`, `title_pca_dim`. A control
+     that quietly changed the norm or the mask would confound "the content is
+     useless" with "the tensor is the wrong size", which is the whole point of
+     running one.
 
 Run:  python scripts/smoke_test.py [--memory_index path.pkl]
 """
@@ -38,9 +43,11 @@ from qformerrec.models.qformer_cie import (  # noqa: E402
     CollabQFormer,
     LLMProjector,
     MemoryEncoder,
+    ablate_content,
     attention_disagreement_loss,
     llm_target_rms,
     mean_offdiag_cosine,
+    pca_reduce,
     soft_slot_plan,
     split_title_list,
     token_decorrelation_loss,
@@ -423,6 +430,90 @@ def test_real_index(path):
           f"users with none={(filled == 0).sum()}/{n_users}")
 
 
+def test_controls():
+    """The controls of RUNSHEET 6.6 must destroy content, not geometry."""
+    print("\n=== 9: controls (memory.ablate / ablate_pref / user_slot / title PCA) ===")
+    d1, d_q, L, B = 32, 16, 4, 24
+    mi = fake_index(d1=d1)
+    uid, iid = torch.arange(B) % 40, torch.arange(B) % 60
+    pit = make_pit(B, width=10)
+
+    # ---- ablate_content: shape and per-row scale survive, content does not
+    x = torch.randn(B, L, d_q) * 3.0
+    for mode in ("random", "shuffle", "mean"):
+        y = ablate_content(x, mode)
+        check(f"ablate_content[{mode}]: shape kept", y.shape == x.shape)
+        check(f"ablate_content[{mode}]: content changed", not torch.allclose(y, x))
+    rms_x = x.pow(2).mean(-1).sqrt()
+    rms_r = ablate_content(x, "random").pow(2).mean(-1).sqrt()
+    check("ablate_content[random]: per-row RMS preserved",
+          torch.allclose(rms_x, rms_r, rtol=0.35), f"max rel err "
+          f"{float(((rms_r - rms_x).abs() / rms_x).max()):.3f}")
+    perm_y = ablate_content(x, "shuffle", perm=torch.arange(B))
+    check("ablate_content[shuffle]: identity perm is a no-op", torch.equal(perm_y, x))
+    check("ablate_content[mean]: every row identical",
+          bool((ablate_content(x, "mean") == x.mean(0, keepdim=True)).all()))
+
+    # ---- memory.ablate leaves mask / type_ids / slot count untouched
+    base = build(mi, d1=d1, d_q=d_q, L=L)
+    mem0, mask0, t0, _, _, _, _ = run(*base[:6], uid, iid, pit=pit)
+    for mode in ("random", "shuffle", "mean"):
+        abl = build(mi, d1=d1, d_q=d_q, L=L, ablate=mode)
+        mem, mask, tids, Z, _, _, _ = run(*abl[:6], uid, iid, pit=pit)
+        check(f"memory.ablate={mode}: mask unchanged", torch.equal(mask, mask0))
+        check(f"memory.ablate={mode}: type_ids unchanged", torch.equal(tids, t0))
+        check(f"memory.ablate={mode}: slot count unchanged", mem.shape == mem0.shape)
+        check(f"memory.ablate={mode}: mem finite, Z finite",
+              bool(torch.isfinite(mem).all() and torch.isfinite(Z).all()))
+        check(f"memory.ablate={mode}: slot contents actually changed",
+              not torch.allclose(mem, mem0))
+    # `random` must cut the gradient to the bank's inputs, or a *training* run in
+    # this mode would still be learning from the memory it is supposed to be denied.
+    # In `run`, U feeds the memory bank only (slot 0 + the neighbour slots); I also
+    # feeds the candidate FiLM path, which is deliberately left intact.
+    mem_enc, qgen, qf, U, I, proj = build(mi, d1=d1, d_q=d_q, L=L, ablate="random")[:6]
+    run(mem_enc, qgen, qf, U, I, proj, uid, iid, pit=pit)[3].sum().backward()
+    check("memory.ablate=random: no gradient reaches the MF user table",
+          U.weight.grad is None or float(U.weight.grad.abs().sum()) == 0.0)
+
+    # ---- user_slot=False masks slot 0 wherever the row has anything else
+    nou = build(mi, d1=d1, d_q=d_q, L=L, use_user_slot=False)
+    mem, mask, _, Z, _, _, _ = run(*nou[:6], uid, iid, pit=pit)
+    other = mask0[:, 1:].any(dim=1)
+    check("user_slot=False: slot 0 masked exactly where another slot is valid",
+          bool((mask[:, 0] == ~other).all()))
+    check("user_slot=False: every row still has >=1 valid key",
+          bool((mask.sum(1) > 0).all()))
+    check("user_slot=False: no NaN downstream (empty-key softmax would NaN)",
+          bool(torch.isfinite(Z).all()))
+
+    # ---- title PCA: k dims, unit mean row norm on covered rows, uncovered stay 0
+    n_items, d_text, k = 60, 48, 8
+    rng = np.random.RandomState(0)
+    T = torch.as_tensor(rng.randn(n_items, d_text).astype(np.float32))
+    covered = torch.ones(n_items, dtype=torch.bool)
+    covered[55:] = False
+    T[~covered] = 0.0
+    red, evr = pca_reduce(T, k, covered)
+    check("title PCA: output width == k", tuple(red.shape) == (n_items, k))
+    check("title PCA: unit mean row norm on covered rows",
+          abs(float(red[covered].norm(dim=1).mean()) - 1.0) < 1e-4)
+    check("title PCA: uncovered rows stay zero", float(red[~covered].abs().sum()) == 0.0)
+    check("title PCA: explained variance in (0, 1]", 0.0 < evr <= 1.0 + 1e-6, f"evr={evr:.3f}")
+    check("title PCA: is deterministic (no RNG consumed)",
+          torch.equal(red, pca_reduce(T, k, covered)[0]))
+
+    mi_t = dict(mi)
+    mi_t["title_emb"] = T.numpy()
+    mi_t["title_covered"] = covered.numpy()
+    me = MemoryEncoder(mi_t, d1=d1, d_q=d_q, k_hist=10, use_title=True, title_pca_dim=k)
+    check("title PCA: MemoryEncoder adopts the reduced width", me.d_text == k)
+    mem, mask, _, _, _ = me(uid, base[3](uid), lambda x: base[4](x),
+                            lambda x: base[3](x), pit_hist=pit)
+    check("title PCA: forward finite with a reduced title table",
+          bool(torch.isfinite(mem).all()))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--memory_index", default=None)
@@ -432,6 +523,7 @@ def main():
     test_core()
     test_splicing()
     test_sampler()
+    test_controls()
     if args.memory_index:
         test_real_index(args.memory_index)
 

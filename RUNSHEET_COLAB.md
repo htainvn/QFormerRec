@@ -865,6 +865,11 @@ Each split logs `auc`, `uauc`, `mean_prompt_tokens`, `eval_seconds`, `ms_per_sam
 
 ### 6.1 Order (stop as soon as the target is met)
 
+**Before any of this, read 6.6.** The 65-slot bank currently scores exactly what a 1-slot
+bank scores (0.7296 both), so tuning `k_hist` or `λ_div` is tuning a component that has not
+been shown to do anything. The controls in 6.6 are evaluations (~85 s each), not runs, and
+one of them decides whether this table is worth executing at all.
+
 Do **all** search on ML-1M only (`freeze_rec: True`, 1 seed). Nothing is lost
 scientifically: CoLLM-MF T2 already clears the Amazon-Book UAUC bar, so **ML-1M UAUC is
 the hard target**.
@@ -950,6 +955,142 @@ the search never touches Amazon.
 Note the configs here are *more* eval-efficient than CoLLM's: `iters_per_epoch: 200`
 (ML-1M) instead of 50, so validation runs 4× less often for the same number of updates.
 Stage 2 as shipped = 40 × 200 × 48 ≈ 11 real epochs over the 33 891 train rows.
+
+### 6.6 Controls — run these before explaining anything
+
+An ablation asks "how much does this component add". A **control** asks the prior question:
+"is this component doing anything at all". The ablations in 6.3 are only interpretable once
+the controls below have run, because a component that contributes zero cannot have an
+explanation — it has a bug or a missing gradient path.
+
+The numbers already on the board for ML-1M valid (full 10 401-row split, AUC):
+
+| Run | best valid AUC | at |
+|---|---|---|
+| stage 3, full model, 65 memory slots | 0.7296 | epoch 6 |
+| `abl_nomemory` — 1 slot, user only, `k_*=0` | **0.7296** | epoch 2 |
+
+Those are the same number. A 65-slot bank scores exactly what a 1-slot bank scores, so
+whatever the Q-Former is reading, it is not the memory. The controls below decide *why*, and
+they run in this order because a positive result on an earlier one makes the later ones moot.
+
+**Every control is an evaluation, not a training run** — ~85 s each on the A100 — except
+where noted. Point them at a trained checkpoint and read the `[valid]` line.
+
+#### Control A — the text-only floor. Run this first.
+
+The stage-1 LoRA alone, plain text prompt, no Q-Former, no memory, no `<UserID>`, no
+`<TargetItemID>`, on the same valid split:
+
+```python
+!python train_qformer.py --cfg-path train_configs/control_stage1_text_ml1m.yaml \
+    --options model.ckpt=/content/ckpt/stage1_lora_ml1m.pth
+```
+
+| Result | Reading |
+|---|---|
+| ≈ 0.725–0.730 | The whole collaborative branch contributes **zero**. The diagnosis is not "the model memorises" — it is "the LLM never reads the soft tokens". Go to control B; the memorisation hypothesis (control C) is irrelevant until B comes back. |
+| clearly below (≤ 0.70) | The collaborative branch is worth something. Control B then says whether the *memory* or only the *MF CIE tokens* are what it is worth. |
+
+Note what this control does **not** cover: the stage-2/3 prompt still splices
+`<TargetItemID>`, which feeds MF into the LLM directly and bypasses the bank entirely. A
+gap between control A and the full model can be entirely that one token.
+
+#### Control B — is the memory read, or are the soft tokens ignored?
+
+Two knobs, each destroying information while keeping shape, scale, slot count, mask and
+attention prior identical. `shuffle` is the strongest form: the marginal distribution of
+vectors is exactly the real one and only the row→memory pairing is broken.
+
+```python
+BEST=/content/logs/stage3_ml1m/<job_id>/checkpoint_best.pth
+# B1: the memory bank says nothing
+!python train_qformer.py --cfg-path train_configs/stage3_qformer_ml1m.yaml --options \
+    run.evaluate=True "run.test_splits=[valid]" model.ckpt=$BEST \
+    model.qformer.memory.ablate=shuffle run.output_dir=/content/logs/ctl_mem_shuffle
+# B2: the L soft tokens themselves say nothing
+!python train_qformer.py --cfg-path train_configs/stage3_qformer_ml1m.yaml --options \
+    run.evaluate=True "run.test_splits=[valid]" model.ckpt=$BEST \
+    model.qformer.ablate_pref=shuffle run.output_dir=/content/logs/ctl_pref_shuffle
+```
+
+| B1 (memory) | B2 (soft tokens) | Reading |
+|---|---|---|
+| flat | flat | The LLM ignores the soft tokens. Fix the token path — norm, position, LoRA adaptation to the short prompt — not the memory. |
+| flat | drops | The tokens are read, but their content comes from somewhere other than the bank (the candidate FiLM code, or the learned `Q0` priors). The bank is decorative. |
+| drops | drops | The bank is genuinely read. Only now do the 6.3 ablations mean anything. |
+
+Modes: `none | random | shuffle | mean`. `random` keeps each row's RMS and randomises the
+direction; `mean` gives every row the batch mean, isolating "does the model use the
+*per-user variation*" from "does it use the token at all". Every control run prints a
+`CONTROL: memory.ablate=… ablate_pref=… user_slot=…` field in the `[qformer]` banner, so a
+result can never be mistaken for a real run.
+
+Ablating during **training** (drop `run.evaluate=True`) answers a different and weaker
+question — "can the model relearn without this" — and costs a full run. Only do it if the
+eval-time control comes back ambiguous.
+
+#### Control C — is the title vector semantics, or a fingerprint?
+
+Only relevant if `use_title: True` is on the table, and only after A and B.
+
+A 4096-d title vector is **one fixed vector per item id**. That is a perfect ID embedding
+handed to the model for free — a key-value lookup of near-unlimited capacity, which the
+model never had to learn how to build. If the titles help, this is the first thing that has
+to be ruled out.
+
+Measure first — it costs seconds, and it tells you which width actually breaks the
+fingerprint. Check `[7]` prints, per candidate width, the explained variance kept and the
+fraction of items that are no longer individually distinguishable (`near_dup`):
+
+```python
+!python scripts/check_title_memory.py --memory_index /content/ckpt/memory_index_ml1m.pkl \
+    --mf_ckpt /content/ckpt/mf_ml1m_d256.pth --title_pca_dims 8,16,32,64
+```
+
+Then train at the width where `near_dup` is high and `evr` is still reasonable:
+
+```python
+!python train_qformer.py --cfg-path train_configs/stage3_qformer_ml1m.yaml --options \
+    model.qformer.memory.use_title=True model.qformer.memory.title_pca_dim=32 \
+    run.output_dir=/content/logs/ctl_title_pca32
+```
+
+PCA to 16–32 dims destroys individual-item identifiability while keeping the coarse
+structure — same-genre items stay clustered. The banner reports the explained-variance
+ratio (`title_pca=32 (evr=…)`), which belongs in the writeup.
+
+| Result | Reading |
+|---|---|
+| valid rises vs `title_pca_dim=0` | Confirmed: the full-width table was being used as a fingerprint, and the reduced one is the fix. |
+| valid flat | Title semantics genuinely do not help here. Stop investing in the title direction. |
+
+This one **is** a training run: the PCA changes `title_proj`'s input width, so a checkpoint
+trained at full width cannot be evaluated at 32.
+
+#### Control D — is the bank just a re-read of slot 0?
+
+Not closed by the per-type attention heatmap. Per *type*, the user slot draws 0.353–0.582
+and the 50 history slots share 0.419–0.647 — but that is 1 slot against ~26 filled ones, so
+per slot the user is ~40× heavier. The diagnostics now print this directly:
+
+```
+  slots_per_row=[user:1.00 hist:25.77 neighbor:8.00 genre:3.00 cluster:3.00 hist_unk:0.02]
+  token3: attn_by_type=[…]  per_slot=[user:0.5130 hist:0.0009 …]  type_bias_softmax=[…]
+```
+
+plus `user_vs_hist_per_slot` in the summary line, and a WARNING above 10×. The control is to
+mask slot 0 outright (rows with no other valid slot keep it, or their softmax would be over
+an empty key set — `user_slot_kept` reports how many, and it must be ~0):
+
+```python
+!python train_qformer.py --cfg-path train_configs/stage3_qformer_ml1m.yaml --options \
+    run.evaluate=True "run.test_splits=[valid]" model.ckpt=$BEST \
+    model.qformer.memory.user_slot=False run.output_dir=/content/logs/ctl_nouser
+```
+
+Flat means the user slot was not carrying the result either, which — combined with a flat
+B1 — says the bank as a whole is inert.
 
 ---
 
@@ -1159,7 +1300,7 @@ empty-history row, and the real memory index's bounds under both history sources
 Builds a **tiny random LLaMA** and runs the real thing through it: registry wiring, the
 real tokenizer's splicing, stage-2 vs stage-3 freeze patterns, forward/backward with every
 loss on, the optimizer's per-group `lr_scale`, a real training epoch, the single-process
-evaluation, the diagnostics dump, **all 21 ablation configs** (including `-pit-history`),
+evaluation, the diagnostics dump, **all 29 ablation/control configs** (including `-pit-history`),
 and an independent check that the test split's history really is point-in-time.
 
 ---
