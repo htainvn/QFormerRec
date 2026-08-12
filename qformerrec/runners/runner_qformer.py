@@ -165,6 +165,12 @@ class RecRunnerQFormer(RecRunnerBase):
                                 cur_epoch, is_best=True,
                                 provenance={"select_metric": metric, "value": float(agg_metrics)},
                             )
+                            # patience counts validations without an improvement in the
+                            # SELECTION metric. It must reset here and nowhere else --
+                            # resetting it in the second-metric block below made the run
+                            # stop on the wrong condition and print "new best" next to a
+                            # nonzero counter.
+                            not_change = 0
                         # Also keep the best epoch under the OTHER metric. AUC and UAUC
                         # rank epochs differently -- they measure different things (AUC is
                         # ~99.8% cross-user pairs, UAUC is 100% within-user), so the epoch
@@ -180,7 +186,6 @@ class RecRunnerQFormer(RecRunnerBase):
                                 cur_epoch, is_best=False, tag=f"best_{other}",
                                 provenance={"select_metric": other, "value": float(ov)},
                             )
-                            not_change = 0
                         val_log.update({"best_epoch": best_epoch})
                         self.log_stats(val_log, split_name)
                         if split_name == "valid":
