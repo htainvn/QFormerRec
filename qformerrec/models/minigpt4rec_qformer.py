@@ -39,6 +39,8 @@ from qformerrec.models.qformer_cie import (
     NoNormLLMProjector,
     ablate_content,
     attention_disagreement_loss,
+    centre_log_prior,
+    global_rank_loss,
     llm_target_rms,
     mean_offdiag_cosine,
     soft_slot_plan,
@@ -102,6 +104,10 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
         ls = _to_dict(loss_cfg)
         self.loss_cfg = {
             "lambda_rank": float(ls.get("lambda_rank", 0.5)),
+            # AUC's direct surrogate. 0.0 keeps every earlier run bit-identical.
+            # `lambda_rank` optimises within-user order (UAUC); this one optimises
+            # order across all pairs, which is what AUC measures.
+            "lambda_rank_global": float(ls.get("lambda_rank_global", 0.0)),
             "lambda_cf": float(ls.get("lambda_cf", 0.2)),
             "lambda_div": float(ls.get("lambda_div", 0.1)),
             "lambda_attn": float(ls.get("lambda_attn", 0.05)),
@@ -156,6 +162,12 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
         # from the outside -- "the memory says nothing useful but the LLM does read
         # the tokens" (memory ablation moves the metric, pref ablation moves it
         # more) from "the LLM ignores the soft tokens entirely" (neither moves it).
+        # The attention prior orders slots inside a type; it was also shifting mass
+        # BETWEEN types, handicapping history ~3 logits against the prototypes.
+        # See `centre_log_prior`. False restores the pre-2026-08-13 behaviour.
+        self.prior_centred = _as_bool(
+            qf.get("prior_centred", True), "model.qformer.prior_centred"
+        )
         self.ablate_pref = str(qf.get("ablate_pref", "none"))
         assert self.ablate_pref in ABLATION_MODES, (
             f"qformer.ablate_pref={self.ablate_pref!r} not in {ABLATION_MODES}"
@@ -195,7 +207,7 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             f"[qformer] d_q={d_q} L={self.n_query} slots={me.n_slots} "
             f"layers={len(self.qformer.layers)} llm_emb_norm={self.llm_emb_norm_mean:.4f} "
             f"target_rms={self.llm_emb_rms:.6f} match_llm_norm={self.match_llm_norm} "
-            f"use_title={me.use_title}"
+            f"use_title={me.use_title} prior_centred={self.prior_centred}"
         )
         if me.use_title:
             banner += f" d_text={me.d_text}"
@@ -210,6 +222,24 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
                        f"ablate_item_id={self.ablate_item_id}")
         print(banner)
         logging.info(banner)
+
+        # Make the handicap a number in every log, not a thing to rediscover.
+        with torch.no_grad():
+            k = max(me.k_hist, 1)
+            hist_lp = float(-torch.arange(1, k + 1).float().log().mean())
+            nb_lp = (float(me.neighbor_sim[me.neighbor_sim > 0].clamp_min(1e-3).log().mean())
+                     if me.k_neighbor > 0 and bool((me.neighbor_sim > 0).any()) else 0.0)
+        pl = (f"[prior] mean log-prior by type: user/genre/cluster=0.00  "
+              f"hist={hist_lp:.2f}  neighbor={nb_lp:.2f}  -> centred={self.prior_centred}")
+        print(pl)
+        logging.info(pl)
+        if not self.prior_centred and min(hist_lp, nb_lp) < -1.0:
+            w = (f"WARNING: uncentred prior puts history {-hist_lp:.1f} and neighbours "
+                 f"{-nb_lp:.1f} logits below every prototype slot before any learning. "
+                 "type_bias has to overcome that just to reach parity, and measured it "
+                 "never does (softmax stays ~0.167). Set qformer.prior_centred=True.")
+            print(w)
+            logging.warning(w)
 
         self.cf_head = CFAuxHead(d_q)
 
@@ -302,7 +332,9 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             )
             queries, cand_code = self.query_gen(item_emb)
             attn_bias = self.query_gen.slot_bias(type_ids)                     # (B, L, N)
-            attn_bias = attn_bias + torch.log(prior.clamp_min(1e-6)).unsqueeze(1)
+            lp = (centre_log_prior(prior, type_ids, mask) if self.prior_centred
+                  else torch.log(prior.clamp_min(1e-6)))
+            attn_bias = attn_bias + lp.unsqueeze(1)
             Z, A = self.qformer(queries, mem, mask, attn_bias)                 # (B,L,d_q), (B,L,N)
             pref_tok = self.pref_proj(Z)                                       # (B, L, d_llm)
             # CONTROL: what the LLM actually receives. Applied after the RMS
@@ -494,6 +526,10 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             loss_rank, n_pairs = within_user_rank_loss(s_rank, samples["UserID"], labels)
             total = total + lc["lambda_rank"] * loss_rank
             parts["loss_rank"] = loss_rank.detach()
+        if lc["lambda_rank_global"] > 0:
+            loss_rg, _ = global_rank_loss(s_rank, labels)
+            total = total + lc["lambda_rank_global"] * loss_rg
+            parts["loss_rank_global"] = loss_rg.detach()
 
         if enc.get("Z") is not None:
             Z, A = enc["Z"], enc["A"]
@@ -635,7 +671,8 @@ class MiniGPT4RecQFormer(MiniGPT4Rec_v2):
             # under the `-user-slot` control, the fraction of rows that had nothing
             # else and kept slot 0 anyway. If this is not ~0 the control is leaky.
             summary["user_slot_kept"] = d.get("user_slot_kept", 0.0) / n
-        for k in ["loss_bce", "loss_rank", "loss_cf", "loss_div", "loss_attn", "loss_var", "loss_align"]:
+        for k in ["loss_bce", "loss_rank", "loss_rank_global", "loss_cf", "loss_div",
+                  "loss_attn", "loss_var", "loss_align"]:
             if d.get(k, 0.0):
                 summary[k] = d[k] / n
         attn = d["attn_by_type"] / n

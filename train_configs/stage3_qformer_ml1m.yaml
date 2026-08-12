@@ -61,7 +61,12 @@ model:
   n_titles_kept: 0            # MUST match stage 2
   diag_log_freq: 200          # steps between anti-collapse diagnostic dumps
 
-  ckpt_lora: /content/logs/stage1_ml1m/checkpoint_best.pth   # cached stage 1
+  ckpt_lora: /content/ckpt/stage1_lora_ml1m_e28.pth   # cached stage 1, epoch 28
+  # NOT the job-id-less path this used to hold: that file never existed, so every
+  # run had to pass --options model.ckpt_lora=... or die on the assert. Copy the
+  # real one to a stable name once:
+  #   cp /content/logs/stage1_ml1m/20260809102/checkpoint_best.pth \
+  #      /content/ckpt/stage1_lora_ml1m_e28.pth
   ckpt: /content/logs/stage2_ml1m/checkpoint_best.pth        # stage-2 best
 
   lora_config:
@@ -83,6 +88,14 @@ model:
     n_heads: 4
     dropout: 0.1
     use_slot_prior: True
+    # The prior orders slots INSIDE a type (recency in history, similarity in
+    # neighbours). Uncentred it also shifted mass BETWEEN types: history sat ~3
+    # logits below every prototype slot, neighbours up to 6.9 below, while user /
+    # genre / cluster got log-prior 0. That handicap fell on the 50 slots carrying
+    # per-row information and exempted the 6 always-present prototype ones.
+    # Centring removes the between-type shift and leaves that arbitration to
+    # `type_bias`, which is what it exists for. False = pre-2026-08-13 behaviour.
+    prior_centred: True
     use_candidate: True       # False = `-candidate` ablation (no FiLM)
     match_llm_norm: True      # False = `-norm-match` ablation
     memory:
@@ -124,6 +137,13 @@ model:
     ablate_pref: none
   loss:
     lambda_rank: 0.5
+    # AUC's direct surrogate: pairwise BPR over ALL pos/neg pairs in the batch,
+    # not just same-user ones. AUC *is* that fraction, and nothing else in this loss
+    # optimises it -- `lambda_rank` is invariant to a per-user shift of the scores,
+    # which is exactly the freedom global AUC measures, and `L_bce` reaches it only
+    # through absolute logit values. Measured: turning the within-user term on moved
+    # UAUC +0.046 and AUC +0.014. 0.0 reproduces every run before 2026-08-12.
+    lambda_rank_global: 0.0
     lambda_cf: 0.2
     lambda_div: 0.1
     lambda_attn: 0.15           # MUST match stage 2 -- see its note

@@ -83,6 +83,45 @@ def split_title_list(titles_str):
     return titles_str.split('", "')
 
 
+def centre_log_prior(prior, type_ids, mask, eps=1e-6):
+    """Zero-mean the log attention prior WITHIN each slot type.
+
+    The prior exists to order slots *inside* a group -- recency inside history,
+    similarity inside neighbours -- but it was added to the same logit scale that
+    decides competition *between* groups, on an absolute scale that differs wildly
+    per type:
+
+        user      1.0                      -> log-prior  0
+        genre     1.0                      -> log-prior  0
+        cluster   1.0                      -> log-prior  0
+        history   1/(rank+1)               -> mean log-prior -log(k!)/k
+                                              = -2.97 at k=50, -2.58 at 33 filled
+        neighbour cosine sim, clamped 1e-3 -> as low as -6.91
+
+    So an average history slot started ~3 logits below every prototype slot -- a
+    19x handicap in odds -- and the handicap fell on the 50 slots that carry
+    per-row information while the 6 always-present prototype slots were exempt.
+    Measured consequences: 3 of the 4 query tokens put 0.89-0.98 of their mass on
+    genre/cluster, neighbours were always weakest, and `type_bias` -- the parameter
+    that exists precisely to arbitrate between types -- stayed at ~0.167 softmax,
+    i.e. uniform, because it would have had to learn +3 just to reach parity.
+
+    Centring per type leaves the within-group ordering untouched and removes the
+    between-group shift, which is `type_bias`'s job. Masked slots are excluded from
+    the mean and left alone; they are set to -inf by the attention mask anyway.
+    """
+    log_prior = torch.log(prior.clamp_min(eps))
+    out = log_prior.clone()
+    for t in range(N_SLOT_TYPES):
+        sel = (type_ids == t) & mask                       # (B, N)
+        if not bool(sel.any()):
+            continue
+        n = sel.sum(-1, keepdim=True).clamp_min(1)
+        mean_t = (log_prior * sel).sum(-1, keepdim=True) / n
+        out = torch.where(sel, log_prior - mean_t, out)
+    return out
+
+
 def ablate_content(x, mode, perm=None, eps=1e-12):
     """Return ``x`` with its information destroyed but its shape/scale kept.
 
@@ -767,6 +806,33 @@ def within_user_rank_loss(scores, users, labels):
         return scores.new_zeros(()), 0
     diff = scores.unsqueeze(1) - scores.unsqueeze(0)
     return F.softplus(-diff[pair]).mean(), n_pairs
+
+
+def global_rank_loss(scores, labels):
+    """`L_rank_global`: pairwise BPR over ALL pos/neg pairs in the batch.
+
+    AUC is, by definition, the fraction of pos/neg pairs ordered correctly across
+    the whole set -- and nothing else in this loss optimises it. ``L_bce`` touches
+    global calibration only through absolute logit values, and
+    ``within_user_rank_loss`` is invariant to a per-user shift of the scores, which
+    is precisely the degree of freedom global AUC measures. Measured on ML-1M:
+    turning the within-user term on moved UAUC +0.046 and AUC +0.014, i.e. almost
+    all of it landed on the metric that term addresses.
+
+    Same-user pairs are deliberately NOT masked out: AUC counts them too, so
+    excluding them would optimise something slightly different from the metric. It
+    barely matters either way -- on ML-1M valid there are ~27M cross-user pairs
+    against ~59k within-user ones, so the two terms are near-disjoint in practice.
+
+    Cost is one (n_pos, n_neg) matrix, at most 48x48 at the shipped batch size.
+    """
+    scores = scores.float()
+    pos = labels.reshape(-1) > 0.5
+    n_pos, n_neg = int(pos.sum()), int((~pos).sum())
+    if n_pos == 0 or n_neg == 0:
+        return scores.new_zeros(()), 0
+    diff = scores[pos].unsqueeze(1) - scores[~pos].unsqueeze(0)
+    return F.softplus(-diff).mean(), n_pos * n_neg
 
 
 def vocab_align_loss(z, embedding_weight, n_sample=8192, generator=None):

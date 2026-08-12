@@ -130,6 +130,7 @@ class RecRunnerQFormer(RecRunnerBase):
         """
         start_time = time.time()
         best_agg_metric, best_epoch, not_change = -100000, 0, 0
+        best_other_metric = -100000.0
         patience = self.config.run_cfg.get("patience", 20)
         patience = int(patience) if patience else 0
         self.set_model_mode(self.config.run_cfg.mode)
@@ -163,6 +164,21 @@ class RecRunnerQFormer(RecRunnerBase):
                             self._save_checkpoint(
                                 cur_epoch, is_best=True,
                                 provenance={"select_metric": metric, "value": float(agg_metrics)},
+                            )
+                        # Also keep the best epoch under the OTHER metric. AUC and UAUC
+                        # rank epochs differently -- they measure different things (AUC is
+                        # ~99.8% cross-user pairs, UAUC is 100% within-user), so the epoch
+                        # that maximises one is routinely not the epoch that maximises the
+                        # other. Without this, answering "what would it have scored if we
+                        # had selected on AUC" costs a full re-run. One extra file per run.
+                        other = "auc" if metric == "uauc" else "uauc"
+                        ov = val_log.get(other)
+                        if (split_name == "valid" and ov is not None
+                                and float(ov) > best_other_metric):
+                            best_other_metric = float(ov)
+                            self._save_checkpoint(
+                                cur_epoch, is_best=False, tag=f"best_{other}",
+                                provenance={"select_metric": other, "value": float(ov)},
                             )
                             not_change = 0
                         val_log.update({"best_epoch": best_epoch})
@@ -203,7 +219,7 @@ class RecRunnerQFormer(RecRunnerBase):
         self.set_model_mode(None)
 
     @main_process
-    def _save_checkpoint(self, cur_epoch, is_best=False, provenance=None):
+    def _save_checkpoint(self, cur_epoch, is_best=False, provenance=None, tag=None):
         """Save only the trainable tensors -- filtered by identity, not by name.
 
         CoLLM's version drops frozen weights by key name::
@@ -260,7 +276,8 @@ class RecRunnerQFormer(RecRunnerBase):
             },
         }
         save_to = os.path.join(
-            self.output_dir, "checkpoint_{}.pth".format("best" if is_best else cur_epoch)
+            self.output_dir,
+            "checkpoint_{}.pth".format(tag or ("best" if is_best else cur_epoch)),
         )
         torch.save(save_obj, save_to)
         n = sum(v.numel() for v in state_dict.values())
